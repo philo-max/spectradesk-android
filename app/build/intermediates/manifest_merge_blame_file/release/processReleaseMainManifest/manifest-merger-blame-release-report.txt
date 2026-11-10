@@ -1,0 +1,177 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="com.spectradesk.camera"
+4    android:versionCode="1"
+5    android:versionName="0.1.0" >
+6
+7    <uses-sdk
+8        android:minSdkVersion="26"
+9        android:targetSdkVersion="35" />
+10
+11    <uses-feature
+11-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:4:5-88
+12        android:name="android.hardware.camera.any"
+12-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:4:19-61
+13        android:required="true" />
+13-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:4:62-85
+14
+15    <!--
+16         Still images are written to the app's own cache and shared via a
+17         FileProvider, so no external storage permission is needed on any
+18         supported API level.
+19    -->
+20    <uses-permission android:name="android.permission.CAMERA" />
+20-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:9:5-65
+20-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:9:22-62
+21
+22    <permission
+22-->[androidx.core:core:1.13.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\3f4414e7258e46b34c51e68305e2ec6f\transformed\core-1.13.1\AndroidManifest.xml:22:5-24:47
+23        android:name="com.spectradesk.camera.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+23-->[androidx.core:core:1.13.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\3f4414e7258e46b34c51e68305e2ec6f\transformed\core-1.13.1\AndroidManifest.xml:23:9-81
+24        android:protectionLevel="signature" />
+24-->[androidx.core:core:1.13.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\3f4414e7258e46b34c51e68305e2ec6f\transformed\core-1.13.1\AndroidManifest.xml:24:9-44
+25
+26    <uses-permission android:name="com.spectradesk.camera.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" />
+26-->[androidx.core:core:1.13.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\3f4414e7258e46b34c51e68305e2ec6f\transformed\core-1.13.1\AndroidManifest.xml:26:5-97
+26-->[androidx.core:core:1.13.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\3f4414e7258e46b34c51e68305e2ec6f\transformed\core-1.13.1\AndroidManifest.xml:26:22-94
+27
+28    <application
+28-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:11:5-39:19
+29        android:allowBackup="false"
+29-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:12:9-36
+30        android:appComponentFactory="androidx.core.app.CoreComponentFactory"
+30-->[androidx.core:core:1.13.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\3f4414e7258e46b34c51e68305e2ec6f\transformed\core-1.13.1\AndroidManifest.xml:28:18-86
+31        android:extractNativeLibs="false"
+32        android:icon="@mipmap/ic_launcher"
+32-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:13:9-43
+33        android:label="@string/app_name"
+33-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:14:9-41
+34        android:supportsRtl="true"
+34-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:15:9-35
+35        android:theme="@style/Theme.SpectraDesk" >
+35-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:16:9-49
+36        <activity
+36-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:18:9-28:20
+37            android:name="com.spectradesk.camera.MainActivity"
+37-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:19:13-41
+38            android:configChanges="orientation|screenSize|keyboardHidden"
+38-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:22:13-74
+39            android:exported="true"
+39-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:20:13-36
+40            android:screenOrientation="portrait"
+40-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:21:13-49
+41            android:theme="@style/Theme.SpectraDesk" >
+41-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:23:13-53
+42            <intent-filter>
+42-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:24:13-27:29
+43                <action android:name="android.intent.action.MAIN" />
+43-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:25:17-69
+43-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:25:25-66
+44
+45                <category android:name="android.intent.category.LAUNCHER" />
+45-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:26:17-77
+45-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:26:27-74
+46            </intent-filter>
+47        </activity>
+48
+49        <provider
+50            android:name="androidx.core.content.FileProvider"
+50-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:31:13-62
+51            android:authorities="com.spectradesk.camera.fileprovider"
+51-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:32:13-64
+52            android:exported="false"
+52-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:33:13-37
+53            android:grantUriPermissions="true" >
+53-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:34:13-47
+54            <meta-data
+54-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:35:13-37:54
+55                android:name="android.support.FILE_PROVIDER_PATHS"
+55-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:36:17-67
+56                android:resource="@xml/file_paths" />
+56-->E:\灰度地带\spectradesk-android\app\src\main\AndroidManifest.xml:37:17-51
+57        </provider>
+58
+59        <service
+59-->[androidx.camera:camera-camera2:1.4.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\dd804001ccda1081b22a1ad281659329\transformed\camera-camera2-1.4.1\AndroidManifest.xml:24:9-33:19
+60            android:name="androidx.camera.core.impl.MetadataHolderService"
+60-->[androidx.camera:camera-camera2:1.4.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\dd804001ccda1081b22a1ad281659329\transformed\camera-camera2-1.4.1\AndroidManifest.xml:25:13-75
+61            android:enabled="false"
+61-->[androidx.camera:camera-camera2:1.4.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\dd804001ccda1081b22a1ad281659329\transformed\camera-camera2-1.4.1\AndroidManifest.xml:26:13-36
+62            android:exported="false" >
+62-->[androidx.camera:camera-camera2:1.4.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\dd804001ccda1081b22a1ad281659329\transformed\camera-camera2-1.4.1\AndroidManifest.xml:27:13-37
+63            <meta-data
+63-->[androidx.camera:camera-camera2:1.4.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\dd804001ccda1081b22a1ad281659329\transformed\camera-camera2-1.4.1\AndroidManifest.xml:30:13-32:89
+64                android:name="androidx.camera.core.impl.MetadataHolderService.DEFAULT_CONFIG_PROVIDER"
+64-->[androidx.camera:camera-camera2:1.4.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\dd804001ccda1081b22a1ad281659329\transformed\camera-camera2-1.4.1\AndroidManifest.xml:31:17-103
+65                android:value="androidx.camera.camera2.Camera2Config$DefaultProvider" />
+65-->[androidx.camera:camera-camera2:1.4.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\dd804001ccda1081b22a1ad281659329\transformed\camera-camera2-1.4.1\AndroidManifest.xml:32:17-86
+66        </service>
+67
+68        <provider
+68-->[androidx.emoji2:emoji2:1.3.0] C:\Users\Tismi\.gradle\caches\8.9\transforms\e9a4de5f87829d8e56de87ff35dfed60\transformed\emoji2-1.3.0\AndroidManifest.xml:24:9-32:20
+69            android:name="androidx.startup.InitializationProvider"
+69-->[androidx.emoji2:emoji2:1.3.0] C:\Users\Tismi\.gradle\caches\8.9\transforms\e9a4de5f87829d8e56de87ff35dfed60\transformed\emoji2-1.3.0\AndroidManifest.xml:25:13-67
+70            android:authorities="com.spectradesk.camera.androidx-startup"
+70-->[androidx.emoji2:emoji2:1.3.0] C:\Users\Tismi\.gradle\caches\8.9\transforms\e9a4de5f87829d8e56de87ff35dfed60\transformed\emoji2-1.3.0\AndroidManifest.xml:26:13-68
+71            android:exported="false" >
+71-->[androidx.emoji2:emoji2:1.3.0] C:\Users\Tismi\.gradle\caches\8.9\transforms\e9a4de5f87829d8e56de87ff35dfed60\transformed\emoji2-1.3.0\AndroidManifest.xml:27:13-37
+72            <meta-data
+72-->[androidx.emoji2:emoji2:1.3.0] C:\Users\Tismi\.gradle\caches\8.9\transforms\e9a4de5f87829d8e56de87ff35dfed60\transformed\emoji2-1.3.0\AndroidManifest.xml:29:13-31:52
+73                android:name="androidx.emoji2.text.EmojiCompatInitializer"
+73-->[androidx.emoji2:emoji2:1.3.0] C:\Users\Tismi\.gradle\caches\8.9\transforms\e9a4de5f87829d8e56de87ff35dfed60\transformed\emoji2-1.3.0\AndroidManifest.xml:30:17-75
+74                android:value="androidx.startup" />
+74-->[androidx.emoji2:emoji2:1.3.0] C:\Users\Tismi\.gradle\caches\8.9\transforms\e9a4de5f87829d8e56de87ff35dfed60\transformed\emoji2-1.3.0\AndroidManifest.xml:31:17-49
+75            <meta-data
+75-->[androidx.lifecycle:lifecycle-process:2.8.7] C:\Users\Tismi\.gradle\caches\8.9\transforms\ef3f1b8cf943e0590111f6b7a018d36f\transformed\lifecycle-process-2.8.7\AndroidManifest.xml:29:13-31:52
+76                android:name="androidx.lifecycle.ProcessLifecycleInitializer"
+76-->[androidx.lifecycle:lifecycle-process:2.8.7] C:\Users\Tismi\.gradle\caches\8.9\transforms\ef3f1b8cf943e0590111f6b7a018d36f\transformed\lifecycle-process-2.8.7\AndroidManifest.xml:30:17-78
+77                android:value="androidx.startup" />
+77-->[androidx.lifecycle:lifecycle-process:2.8.7] C:\Users\Tismi\.gradle\caches\8.9\transforms\ef3f1b8cf943e0590111f6b7a018d36f\transformed\lifecycle-process-2.8.7\AndroidManifest.xml:31:17-49
+78            <meta-data
+78-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:29:13-31:52
+79                android:name="androidx.profileinstaller.ProfileInstallerInitializer"
+79-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:30:17-85
+80                android:value="androidx.startup" />
+80-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:31:17-49
+81        </provider>
+82
+83        <receiver
+83-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:34:9-52:20
+84            android:name="androidx.profileinstaller.ProfileInstallReceiver"
+84-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:35:13-76
+85            android:directBootAware="false"
+85-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:36:13-44
+86            android:enabled="true"
+86-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:37:13-35
+87            android:exported="true"
+87-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:38:13-36
+88            android:permission="android.permission.DUMP" >
+88-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:39:13-57
+89            <intent-filter>
+89-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:40:13-42:29
+90                <action android:name="androidx.profileinstaller.action.INSTALL_PROFILE" />
+90-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:41:17-91
+90-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:41:25-88
+91            </intent-filter>
+92            <intent-filter>
+92-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:43:13-45:29
+93                <action android:name="androidx.profileinstaller.action.SKIP_FILE" />
+93-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:44:17-85
+93-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:44:25-82
+94            </intent-filter>
+95            <intent-filter>
+95-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:46:13-48:29
+96                <action android:name="androidx.profileinstaller.action.SAVE_PROFILE" />
+96-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:47:17-88
+96-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:47:25-85
+97            </intent-filter>
+98            <intent-filter>
+98-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:49:13-51:29
+99                <action android:name="androidx.profileinstaller.action.BENCHMARK_OPERATION" />
+99-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:50:17-95
+99-->[androidx.profileinstaller:profileinstaller:1.3.1] C:\Users\Tismi\.gradle\caches\8.9\transforms\4d07dd122260385b5a0f7c79a656e780\transformed\profileinstaller-1.3.1\AndroidManifest.xml:50:25-92
+100            </intent-filter>
+101        </receiver>
+102    </application>
+103
+104</manifest>

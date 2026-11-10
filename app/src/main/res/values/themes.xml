@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark instrument theme: a camera viewfinder next to a bright UI makes the
+         preview look wrong, and a measurement tool should not add its own
+         adaptation to the operator's eye. -->
+    <style name="Theme.SpectraDesk" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#0B1116</item>
+        <item name="android:navigationBarColor">#0B1116</item>
+        <item name="android:windowBackground">#0B1116</item>
+    </style>
+</resources>
