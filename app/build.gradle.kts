@@ -98,6 +98,11 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
+    // 录像
+    implementation("androidx.camera:camera-video:$camerax")
+    // 实时滤镜：CameraEffect / SurfaceProcessor 在 camera-effects 里。
+    // 这是唯一能把同一路处理后的帧同时送到预览、照片、录像的通道。
+    implementation("androidx.camera:camera-effects:$camerax")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")

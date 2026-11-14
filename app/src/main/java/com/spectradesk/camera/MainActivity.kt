@@ -62,6 +62,8 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -364,8 +366,65 @@ fun CameraScreen(controller: CameraController?) {
                 modifier = Modifier
                     .fillMaxHeight()
                     .aspectRatio(state.settings.frameAspect.portraitRatio)
-                    .background(colors.scrim),
+                    .background(colors.scrim)
+                    // 点按对焦。取景器是自绘 SurfaceView，不是 PreviewView，
+                    // 所以自己把点击位置换算成归一化坐标交给 controller。
+                    .pointerInput(state.settings.lensFacing) {
+                        detectTapGestures { offset ->
+                            val w = size.width
+                            val h = size.height
+                            if (w > 0 && h > 0) {
+                                val nx = offset.x / w
+                                val ny = offset.y / h
+                                scope.launch {
+                                    val ok = controller?.focusAtPoint(w, h, nx, ny) ?: false
+                                    vm.reportFocus(ok, nx, ny)
+                                }
+                            }
+                        }
+                    },
             )
+
+            // 水印预览。和存盘用的是同一份 WatermarkRenderer 几何参数，
+            // 所以位置、字号、行距完全一致 —— 不会出现"预览在左下、
+            // 成片偏了一点"。
+            if (state.settings.watermark.enabled) {
+                val wm = state.settings.watermark
+                val lines = WatermarkContent.now(wm, "光年相机").lines(wm)
+                if (lines.isNotEmpty()) {
+                    val corner = wm.corner
+                    Column(
+                        Modifier
+                            .align(
+                                when (corner) {
+                                    Watermark.Corner.TOP_LEFT -> Alignment.TopStart
+                                    Watermark.Corner.TOP_RIGHT -> Alignment.TopEnd
+                                    Watermark.Corner.BOTTOM_LEFT -> Alignment.BottomStart
+                                    Watermark.Corner.BOTTOM_RIGHT -> Alignment.BottomEnd
+                                },
+                            )
+                            .padding(14.dp)
+                            .then(
+                                if (wm.style == Watermark.Style.CARD) {
+                                    Modifier
+                                        .background(
+                                            Color.Black.copy(alpha = 0.55f),
+                                            RoundedCornerShape(6.dp),
+                                        )
+                                        .padding(horizontal = 8.dp, vertical = 6.dp)
+                                } else {
+                                    Modifier
+                                },
+                            ),
+                        horizontalAlignment =
+                            if (corner.isRight) Alignment.End else Alignment.Start,
+                    ) {
+                        lines.forEach { line ->
+                            Text(line, color = Color.White, style = MonoSmall)
+                        }
+                    }
+                }
+            }
 
             // 测量准星：只有开测量模式才显示，否则普通拍照/录像时它是干扰。
             if (state.paramsOpen) {
