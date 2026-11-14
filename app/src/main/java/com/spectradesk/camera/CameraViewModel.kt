@@ -273,6 +273,17 @@ class CameraViewModel : ViewModel() {
         }
     }
 
+    /** 取景器 / 成片比例。切换会重建相机管线（三条流都要跟着变）。 */
+    fun setFrameAspect(aspect: FrameAspect) {
+        _state.update {
+            if (it.settings.frameAspect == aspect) it
+            else it.copy(
+                settings = it.settings.copy(frameAspect = aspect),
+                message = "画幅已切到 ${aspect.label}",
+            )
+        }
+    }
+
     /** 手动调色：拖滑杆时高频调用，只写状态，不下发相机。 */
     fun setGradeChannel(channel: ColorGrade.Channel, value: Float) {
         _state.update {

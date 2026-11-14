@@ -32,7 +32,8 @@ spectradesk-android/
 | 滤镜强度 | ✅ | 0–100% 连续可调，实时生效 |
 | **手动调色** | ✅ | 10 项滑杆 + 7 个预设，参考剪映/醒图 |
 | **前后置切换** | ✅ | 一键切换，前置自动镜像 |
-| 拍照 | ✅ | 存入相册 `Pictures/LightYear` |
+| **画幅比例** | ✅ | 16:9 / 4:3，取景器+预览+照片三者同比例 |
+| 拍照 | ✅ | 16:9 或 4:3，存入相册 `Pictures/LightYear` |
 | 录像 | ✅ | H.264 MP4，1080×1920，存入 `Movies/LightYear` |
 | 录音 | ✅ | 可开关；未授权时静默降级为无声录像 |
 | 变焦 | ✅ | 滑杆 + 快捷档位（0.6/1/2/3/5/10×） |
@@ -45,17 +46,88 @@ spectradesk-android/
 |---|---|---|
 | ![live](screenshots/lightyear-01-live.png) | ![params](screenshots/lightyear-20-params-full.png) | ![film](screenshots/lightyear-21-grade-film.png) |
 
+画幅切换：16:9 铺满取景器，4:3 上下留黑（同系统相机行为）：
+
+| 16:9（默认） | 4:3 | 前置（镜像） |
+|---|---|---|
+| ![169](screenshots/lightyear-30-16x9.png) | ![43](screenshots/lightyear-31-4x3.png) | ![front](screenshots/lightyear-32-front-live.png) |
+
 调色效果是**实时**的，且**烧进视频**：
 
-| 调色后的取景器 | 前置（镜像） | 从录制视频抽帧 |
-|---|---|---|
-| ![grade](screenshots/lightyear-22-grade-live.png) | ![front](screenshots/lightyear-23-front.png) | ![video](screenshots/lightyear-24-video-graded.png) |
+| 调色后的取景器 | 从录制视频抽帧 |
+|---|---|
+| ![grade](screenshots/lightyear-22-grade-live.png) | ![video](screenshots/lightyear-24-video-graded.png) |
 
 **滤镜确实烧进了视频**，不是只在取景器里做样子。从录好的 MP4 抽帧：
 
 | 黑白滤镜录制的视频 | 冷调滤镜录制的视频 |
 |---|---|
 | ![mono](screenshots/lightyear-06-video-mono.png) | ![cool](screenshots/lightyear-07-video-cool.png) |
+
+## 一·补一、三条流必须同比例（"镜头被拉长"的真因）
+
+相机应用最容易出错的地方是**预览流 / 照片 / 取景器 View 三者比例不一致**。
+任意两者不同，用户框住的和他拍到的就不是同一块画面。
+
+实测踩到的坑，两个都表现为"镜头拉长了"：
+
+| 现象 | 根因 | 量化 |
+|---|---|---|
+| 取景器视野变窄、像加了变焦 | 预览流默认 4:3（1632×1224），取景器是 0.569 竖屏，shader 只能横向裁 | **保留水平视野 75.9%，等效 1.32× 变焦** |
+| 成片比看到的多出上下一条 | ImageCapture 默认给传感器最大 4:3（4096×3072） | 照片 1.333 vs 取景器 0.5624 |
+
+修法是让三条流都跟着 `FrameAspect` 走：
+
+```kotlin
+// 预览与照片都用同一个 AspectRatioStrategy
+ResolutionSelector.Builder()
+    .setAspectRatioStrategy(if (ratio == 16/9) RATIO_16_9_FALLBACK_AUTO_STRATEGY
+                            else RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+```
+
+16:9 时预览流拿到 1920×1080，取景器 1176×2091（比例 0.5624），
+裁切量降到 1% 以内，**等效变焦回到 1.00×**；照片也变成 4096×2304。
+
+### 同类软件是这么做的（REA 静态分析实证）
+
+InstaShot 有 `com.camerasideas.instashot.widget.AspectRatioFrameLayout`，
+`onMeasure` 的逻辑就是按固定比例重算 View 尺寸：
+
+```java
+float f15 = (this.aspectRatio / (measuredWidth / measuredHeight)) - 1.0f;
+if (Math.abs(f15) <= 0.01f) return;          // 比例已匹配，不动
+// 否则按 resizeMode 重算宽或高
+super.onMeasure(makeMeasureSpec(newW, EXACTLY), makeMeasureSpec(newH, EXACTLY));
+```
+
+**结论：取景器是按比例约束测量的，不是自由填满。** 这正是本项目改成
+`aspectRatio(portraitRatio)` 的依据 —— 不是拍脑袋，是照着同类应用的做法。
+
+## 一·补二、切镜头必须释放旧处理器
+
+"切前置没反应"的根因不是选错了相机 —— logcat 明确显示 `Camera ID: 1`（前置）
+已连接。真正的原因是**旧的 GlFilterProcessor 没被释放**：
+
+```
+$ adb shell ps -T -p <pid> | grep -c gl-filter
+2        ← 切一次镜头就多一个
+```
+
+`bind()` 每次都 `new` 一个处理器，但旧的那个自己的 HandlerThread、EGL 上下文、
+以及挂在取景器 Surface 上的绘制全都还活着。两个处理器轮流往**同一个**
+SurfaceView 上画：新相机（前置）的帧和旧相机（后置）的最后一帧在抢同一个
+缓冲区，视觉上就是画面没变。
+
+修法是在 `bind()` 开头显式释放旧处理器并摘掉取景器回调：
+
+```kotlin
+filterProcessor?.let { runCatching { it.release() } }
+filterProcessor = null
+previewView.onSurfaceAvailable = null
+previewView.onSurfaceSizeChanged = null
+```
+
+修后 `grep -c gl-filter` 恒为 1，前置画面立刻变成前置视角。
 
 ## 一·补、调色为什么单独一层
 

@@ -2,11 +2,15 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
-    <!-- Still images are written to the app's own cache and shared via a
-         FileProvider, so no external storage permission is needed on any
-         supported API level. -->
+    <!-- 照片和视频写进系统图库（MediaStore），所以不需要外部存储权限。
+         只有 API 28 及以下写文件需要 WRITE_EXTERNAL_STORAGE。 -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
 
     <application
         android:allowBackup="false"

@@ -199,6 +199,12 @@ object Colorimetry {
     fun srgbToLinear(v: Double): Double =
         if (v <= 0.04045) v / 12.92 else ((v + 0.055) / 1.055).pow(2.4)
 
+    /** Encode linear light (0..1) as sRGB. Inverse of [srgbToLinear]. */
+    fun srgbEncode(v: Double): Double {
+        val c = v.coerceAtLeast(0.0)
+        return if (c <= 0.0031308) c * 12.92 else 1.055 * c.pow(1.0 / 2.4) - 0.055
+    }
+
     /**
      * Approximate reflectance curve from three white-balanced camera channels.
      *

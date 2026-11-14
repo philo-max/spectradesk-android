@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -224,7 +225,7 @@ fun CameraScreen(controller: CameraController?) {
     // change often. Its coroutine scope is cancelled the moment the composable
     // leaves the composition, which surfaces as "coroutine scope left the
     // composition" and a silent fallback to a black preview.
-    LaunchedEffect(controller, previewView, state.settings.lensFacing) {
+    LaunchedEffect(controller, previewView, state.settings.lensFacing, state.settings.frameAspect) {
         val c = controller ?: return@LaunchedEffect
         val view = previewView ?: return@LaunchedEffect
         try {
@@ -235,6 +236,7 @@ fun CameraScreen(controller: CameraController?) {
                 filter = if (state.liveFilterOn) state.filter else LiveFilter.NONE,
                 intensity = state.settings.filterIntensity,
                 grade = state.settings.grade,
+                frameAspect = state.settings.frameAspect,
             )
             bound = true
         } catch (e: kotlinx.coroutines.CancellationException) {
@@ -339,13 +341,30 @@ fun CameraScreen(controller: CameraController?) {
                 .padding(horizontal = 12.dp, vertical = 4.dp)
                 .clip(PanelShape)
                 .border(1.dp, colors.outlineVariant, PanelShape),
+            contentAlignment = Alignment.Center,
         ) {            AndroidView(
                 factory = { ctx ->
                     PreviewSurfaceView(ctx).also {
                         previewView = it
                     }
                 },
-                modifier = Modifier.fillMaxSize().background(colors.scrim),
+                // 取景器按用户选的比例定形，和预览流、照片三者一致。
+                //
+                // 之前这里是 fillMaxSize()：取景器变成 1176×2067（比例 0.569），
+                // 而默认的 4:3 预览流竖过来是 0.75，shader 只能横向裁掉 24%，
+                // 等效多出 1.32× 变焦 —— 用户看到的"镜头拉长"就是这么来的。
+                //
+                // 现在三条流都跟着 state.settings.frameAspect 走：
+                // 16:9 时取景框比例 0.5625，几乎正好等于屏幕可用区域，
+                // 裁切量降到 1% 以内，等效放大回到 1.00×。
+                //
+                // `fillMaxHeight()` 让取景框先吃满可用高度，再由 aspectRatio
+                // 反推宽度 —— 否则在 4:3 下宽高比 0.75 会留下左右黑边，
+                // 在 16:9 下又会因为 weight 容器没收缩而上下留黑。
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .aspectRatio(state.settings.frameAspect.portraitRatio)
+                    .background(colors.scrim),
             )
 
             // 测量准星：只有开测量模式才显示，否则普通拍照/录像时它是干扰。
@@ -433,6 +452,7 @@ fun CameraScreen(controller: CameraController?) {
                         onGradeChannel = { ch, v -> vm.setGradeChannel(ch, v) },
                         onGradePreset = { vm.applyGradePreset(it) },
                         onGradeReset = { vm.resetGrade() },
+                        onFrameAspect = { vm.setFrameAspect(it) },
                     )
                 }
             }
@@ -586,6 +606,7 @@ private fun ParamsPanel(
     onGradeChannel: (ColorGrade.Channel, Float) -> Unit,
     onGradePreset: (String) -> Unit,
     onGradeReset: () -> Unit,
+    onFrameAspect: (FrameAspect) -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
 
@@ -614,6 +635,33 @@ private fun ParamsPanel(
             .border(1.dp, colors.outlineVariant, PanelShape)
             .padding(horizontal = 14.dp, vertical = 10.dp),
     ) {
+        // 画幅比例。放最上面：它决定下面所有参数作用在多大的画面上。
+        ParamRow(label = "画幅", value = state.settings.frameAspect.label) {
+            Row(
+                Modifier.fillMaxWidth().padding(top = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                FrameAspect.entries.forEach { asp ->
+                    val active = state.settings.frameAspect == asp
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .clip(ChipShape)
+                            .background(if (active) colors.secondary else colors.surfaceVariant)
+                            .clickable { onFrameAspect(asp) }
+                            .padding(vertical = 6.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            asp.label,
+                            color = if (active) colors.onSecondary else colors.onSurfaceVariant,
+                            style = MonoSmall,
+                        )
+                    }
+                }
+            }
+        }
+
         // 变焦。下界取设备的真实下限 —— 带超广角的机型是 0.6，不是 1.0。
         //
         // 之前这里写死 `1f..zoomMax`，于是 0.6–1.0 那段永远拖不到，

@@ -91,6 +91,7 @@ class CameraController(private val context: Context) {
         filter: LiveFilter = LiveFilter.NONE,
         intensity: Float = 1f,
         grade: ColorGrade = ColorGrade.NONE,
+        frameAspect: FrameAspect = FrameAspect.RATIO_16_9,
     ): CapabilitySnapshot {
         val cameraProvider = awaitProvider()
         provider = cameraProvider
@@ -109,6 +110,26 @@ class CameraController(private val context: Context) {
             previewView.display?.rotation ?: android.view.Surface.ROTATION_0
         }.getOrDefault(android.view.Surface.ROTATION_0)
         Log.i(TAG, "display rotation=$displayRotation")
+
+        // 重绑前必须把上一次的处理器彻底释放。
+        //
+        // 这是"切前置没反应"的根因：bind() 每次都 new 一个 GlFilterProcessor，
+        // 但旧的那个没人管 —— 它自己的 HandlerThread、EGL 上下文、以及挂在
+        // 取景器 Surface 上的绘制全都还活着。实测切一次镜头后 ps 里有两个
+        // `gl-filter` 线程，两个处理器轮流往**同一个** SurfaceView 上画：
+        // 新相机（前置）的帧和旧相机（后置）的最后一帧在抢同一个缓冲区，
+        // 视觉上就是画面没变。
+        //
+        // 顺序很重要：先摘掉取景器回调（否则旧处理器还会收到 surface 事件），
+        // 再 release（它会 quitSafely 自己的线程）。
+        filterProcessor?.let { old ->
+            Log.i(TAG, "bind: releasing previous processor")
+            runCatching { old.release() }
+        }
+        filterProcessor = null
+        // 旧处理器注册在 PreviewSurfaceView 上的回调也要清掉，新处理器会重装。
+        previewView.onSurfaceAvailable = null
+        previewView.onSurfaceSizeChanged = null
 
         // 处理器先建好：预览的 SurfaceProvider 要用它，取景器的 Surface 也要挂上去。
         val processor = GlFilterProcessor().apply {
@@ -133,7 +154,36 @@ class CameraController(private val context: Context) {
         }
         // 预览的相机帧交给处理器自己的 SurfaceTexture，由它处理后画到取景器。
         // 不经过 PreviewView 的变换链 —— 那条链会和 SurfaceProcessor 打架。
+        //
+        // ## 为什么要指定 16:9 的预览分辨率
+        //
+        // 默认按屏幕比例给，实测拿到 1632×1224（4:3）。取景器是 1176×2067
+        // （比例 0.569），4:3 竖过来是 0.75 —— 两者差很多，shader 的填充裁剪
+        // 只能把画面横向裁掉 24%：
+        //
+        //   保留水平视野 75.9%，等效多了 1.32× 变焦
+        //
+        // 这就是"镜头被拉长了"的原因：不是焦距变了，是取景器在吃画面。
+        // 换成 16:9（比例 0.5625）几乎正好等于取景器的 0.5689，裁切量降到
+        // 1% 以内，等效放大回到 1.00×。
+        //
+        // 用 `ResolutionSelector` 而不是 `setTargetResolution`：后者在
+        // CameraX 1.4 已废弃，且不参与 resolution 排序策略。
+        //
+        // 比例来自用户的 [frameAspect] 设置 —— 取景器、预览流、照片三者
+        // 必须同比例，否则"框住的"和"拍到的"不是同一块画面。
+        val ratioStrategy = when (frameAspect) {
+            FrameAspect.RATIO_4_3 ->
+                androidx.camera.core.resolutionselector.AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
+            FrameAspect.RATIO_16_9 ->
+                androidx.camera.core.resolutionselector.AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY
+        }
+        val previewSelector = androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
+            .setAspectRatioStrategy(ratioStrategy)
+            .build()
+
         val previewUseCase = Preview.Builder()
+            .setResolutionSelector(previewSelector)
             .setTargetRotation(displayRotation)
             .build().also { preview ->
                 preview.setSurfaceProvider { request ->
@@ -145,6 +195,18 @@ class CameraController(private val context: Context) {
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
             .setFlashMode(ImageCapture.FLASH_MODE_OFF)
             .setTargetRotation(displayRotation)
+            // 照片也按 16:9，和取景器一致。
+            //
+            // 不指定时 ImageCapture 给传感器最大 4:3（实测 4096×3072）。
+            // 取景器是 16:9，于是**拍出来的比看到的多出上下一条** ——
+            // 用户构图时框住的画面和成片不是一回事，这是最容易被投诉的
+            // 那类不一致。同类应用（InstaShot 的 AspectRatioFrameLayout）
+            // 都是让取景器和输出同比例。
+            .setResolutionSelector(
+                androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(ratioStrategy)
+                    .build(),
+            )
             .build()
 
         // 录像：优先 FHD，不支持就退回 HD/SD。FallbackStrategy 让它自动降级，

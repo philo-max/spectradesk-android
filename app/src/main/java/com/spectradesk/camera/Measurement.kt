@@ -60,6 +60,14 @@ data class CameraSettings(
     val grade: ColorGrade = ColorGrade.NONE,
     /** 界面用的调色预设名，null = 手动调过、不对应任何预设。 */
     val gradePreset: String? = "原片",
+    /**
+     * 取景器与成片的宽高比。
+     *
+     * 这不是纯显示选项：它决定预览流、照片、取景器三者是否同比例。
+     * 三者不一致时，"框住的"和"拍到的"就不是同一块画面 —— 这是相机
+     * 应用最容易被投诉的那类问题。
+     */
+    val frameAspect: FrameAspect = FrameAspect.RATIO_16_9,
 ) {
     fun gammaLabel(): String =
         if (gammaCorrected) "GC 开 · sRGB→线性" else "GC 关 · 按线性处理"
@@ -168,6 +176,43 @@ object Standards {
     }
 
     fun byName(name: String): ColorStandard? = all.firstOrNull { it.name == name }
+}
+
+/**
+ * 取景器与成片的宽高比。
+ *
+ * ## 为什么这是一个真选项，而不是"随手改个值"
+ *
+ * 相机应用里最容易出错的地方就是**三条流比例不一致**：
+ * 预览流、照片、取景器 View。任意两者不同，用户框住的和他拍到的
+ * 就不是同一块画面。
+ *
+ * 本项目的实测教训：预览默认给了 4:3（1632×1224），取景器是 0.569 的
+ * 竖屏，shader 只能横向裁掉 24% —— 等效多出 1.32× 变焦，观感就是
+ * "镜头被拉长了"。同时照片给的是 4:3 4096×3072，比取景器宽，
+ * 成片比看到的多出上下一条。
+ *
+ * 所以这里把比例做成显式设置，三条流都跟着它走。
+ *
+ * ## 为什么默认 16:9
+ *
+ * 竖屏手机 16:9 的取景框（0.5625）几乎正好等于屏幕可用区域的比例，
+ * 不裁切也不留黑边，等效变焦正好 1.00×。4:3 会裁掉左右，等效 1.33×。
+ * 同类应用（InstaShot 的 AspectRatioFrameLayout）也是按固定比例测量
+ * 取景器，而不是让它自由填满。
+ */
+enum class FrameAspect(val label: String, val ratio: Float) {
+    RATIO_16_9("16:9", 16f / 9f),
+    RATIO_4_3("4:3", 4f / 3f),
+    ;
+
+    /** 竖屏取景器用的高宽比（Compose 的 aspectRatio 是宽/高）。 */
+    val portraitRatio: Float get() = 1f / ratio
+
+    companion object {
+        fun fromName(name: String?): FrameAspect =
+            entries.firstOrNull { it.name == name } ?: RATIO_16_9
+    }
 }
 
 /** Small helpers shared by the UI. */
