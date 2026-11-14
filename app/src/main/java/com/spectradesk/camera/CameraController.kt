@@ -298,6 +298,131 @@ class CameraController(private val context: Context) {
      *
      * 现在改成绑定完成后主动取一次，UI 只是被动接收，不存在时序竞态。
      */
+    /**
+     * 这台设备的超广角物理相机 ID，没有则 null。
+     *
+     * ## 为什么走 physical camera，而不是找另一颗逻辑相机
+     *
+     * 上一版试过"在 CameraX 的相机列表里挑 zoom 下限最小的那颗"，结论是
+     * 拿不到：`CameraManager.cameraIdList` 只返回 2 个（id 0 后置、id 1 前置），
+     * 两者 zoomRatioRange 都是 1.0–10.0。那颗 0.6 起的相机没有作为独立
+     * 逻辑相机暴露给三方应用。
+     *
+     * 但它的**物理 ID 是可见的**：这颗后置逻辑相机的
+     * `android.logicalMultiCamera.physicalIds = [3, 0]`，
+     * 其中 0 是主摄、3 是超广角。Camera2 允许在请求里指定
+     * `CaptureRequest.PHYSICAL_CAMERA_ID`，让这颗逻辑相机的某个物理子相机
+     * 单独出图 —— 这就是系统相机做 0.6× 的方式。
+     */
+    private fun findUltraWidePhysicalId(): String? {
+        val manager = runCatching {
+            context.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+        }.getOrNull() ?: return null
+        val backId = runCatching { manager.cameraIdList }
+            .getOrDefault(emptyArray())
+            .firstOrNull { id ->
+                runCatching {
+                    manager.getCameraCharacteristics(id)
+                        .get(android.hardware.camera2.CameraCharacteristics.LENS_FACING)
+                }.getOrNull() == android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK
+            } ?: return null
+
+        val chars = runCatching { manager.getCameraCharacteristics(backId) }.getOrNull()
+            ?: return null
+        // `getPhysicalCameraIds()` 是公开 API，返回这颗逻辑相机的物理子相机。
+        // 实测这台机器返回 [0, 3]：0 是主摄、3 是超广角。
+        val physical: Set<String> = runCatching { chars.physicalCameraIds }.getOrNull()
+            ?: return null
+
+        // 逐个物理 ID 看焦距：超广角的焦距明显更短。
+        // 主摄 4.84mm，超广角 1.66mm —— 差近 3 倍，不用猜。
+        var best: Pair<String, Float>? = null
+        for (id in physical) {
+            val pc = runCatching { manager.getCameraCharacteristics(id) }.getOrNull() ?: continue
+            val focal = runCatching {
+                pc.get(android.hardware.camera2.CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            }.getOrNull()?.firstOrNull() ?: continue
+            Log.i(TAG, "physical camera id=$id focal=${focal}mm")
+            if (best == null || focal < best!!.second) best = id to focal
+        }
+        val picked = best?.first
+        Log.i(TAG, "findUltraWidePhysicalId: $picked (focal=${best?.second}mm)")
+        return picked
+    }
+
+    /**
+     * 切换超广角物理相机。
+     *
+     * 传 null 表示回到主摄（清掉物理相机覆盖）。
+     *
+     * ## 实现约束（重要）
+     *
+     * `CaptureRequest.PHYSICAL_CAMERA_ID` 在公开 SDK 里**不存在** —— 它是
+     * `CameraCharacteristics.getAvailablePhysicalCameraRequestKeys()` 暴露的
+     * 运行时 key，必须从那里取，不能写成常量。
+     *
+     * 所以这里先问设备"你能接受哪些物理相机请求 key"，找到名字含
+     * `PHYSICAL_CAMERA_ID` 的那个再用。找不到就说明这颗逻辑相机不支持
+     * 单独驱动物理子相机，如实返回 false，而不是假装成功。
+     */
+    suspend fun setUltraWide(enabled: Boolean): Boolean {
+        val c = camera ?: return false
+        return try {
+            val ext = Camera2CameraControl.from(c.cameraControl)
+            if (!enabled) {
+                ext.clearCaptureRequestOptions().get()
+                Log.i(TAG, "ultra-wide off (main camera)")
+                return true
+            }
+            val id = findUltraWidePhysicalId() ?: run {
+                Log.w(TAG, "no ultra-wide physical camera")
+                return false
+            }
+            val key = physicalCameraIdKey() ?: run {
+                Log.w(TAG, "device exposes no PHYSICAL_CAMERA_ID request key")
+                return false
+            }
+            val opts = CaptureRequestOptions.Builder()
+                .setCaptureRequestOption(key, id)
+                .build()
+            ext.setCaptureRequestOptions(opts).get()
+            Log.i(TAG, "ultra-wide on (physical id=$id via ${key.name})")
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "setUltraWide($enabled) failed", e)
+            false
+        }
+    }
+
+    /**
+     * 从设备暴露的物理相机请求 key 里找出 `PHYSICAL_CAMERA_ID`。
+     *
+     * 这个 key 不在公开 SDK 常量表里，只能按名字匹配。找不到返回 null ——
+     * 有些机型确实不支持单独驱动物理子相机。
+     */
+    private fun physicalCameraIdKey(): CaptureRequest.Key<String>? {
+        val manager = runCatching {
+            context.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+        }.getOrNull() ?: return null
+        val backId = runCatching { manager.cameraIdList }
+            .getOrDefault(emptyArray())
+            .firstOrNull { id ->
+                runCatching {
+                    manager.getCameraCharacteristics(id)
+                        .get(android.hardware.camera2.CameraCharacteristics.LENS_FACING)
+                }.getOrNull() == android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK
+            } ?: return null
+        val chars = runCatching { manager.getCameraCharacteristics(backId) }.getOrNull()
+            ?: return null
+        @Suppress("UNCHECKED_CAST")
+        return chars.availablePhysicalCameraRequestKeys
+            ?.firstOrNull { it.name.contains("PHYSICAL_CAMERA_ID", ignoreCase = true) }
+                as? CaptureRequest.Key<String>
+    }
+
+    /** 设备是否有可用的超广角物理相机。 */
+    fun hasUltraWide(): Boolean = findUltraWidePhysicalId() != null
+
     fun capabilitySnapshot(): CapabilitySnapshot {
         val zoom = zoomRange()
         val exp = exposureRange()
@@ -313,6 +438,8 @@ class CameraController(private val context: Context) {
             hasUltraWide = zoom.first < 0.999f,
             exposureStepEv = step,
             ultraWideBlocked = ultraWideUnavailable,
+            ultraWideAvailable = findUltraWidePhysicalId() != null,
+            minFocusDiopters = minFocusDiopters(),
         )
     }
 
@@ -378,6 +505,91 @@ class CameraController(private val context: Context) {
         ).setAutoCancelDuration(3, java.util.concurrent.TimeUnit.SECONDS).build()
         return runCatching { c.cameraControl.startFocusAndMetering(action).get().isFocusSuccessful }
             .getOrDefault(false)
+    }
+
+    /**
+     * 点按对焦（按归一化坐标，不依赖 PreviewView）。
+     *
+     * 我们的取景器是自绘的 SurfaceView，不是 PreviewView，所以不能用
+     * `previewView.meteringPointFactory`。CameraX 提供
+     * `CameraControl.startFocusAndMetering` 需要 `MeteringPoint`，
+     * 用 `MeteringPointFactory` 的两个工厂方法按像素坐标建点：
+     * 这里按取景器的实际像素尺寸构造，再把归一化坐标换算过去。
+     *
+     * 取景器是中心裁剪填充的（见 shader 的 fill-crop），所以点按位置到
+     * 传感器坐标还要考虑裁剪 —— 用 `FillCropMeteringPointFactory`
+     * 的行为自己算，保证"点哪里对焦哪里"。
+     */
+    suspend fun focusAtPoint(viewW: Int, viewH: Int, nx: Float, ny: Float): Boolean {
+        val c = camera ?: return false
+        if (viewW <= 0 || viewH <= 0) return false
+        val display = previewSurfaceView?.display ?: return false
+        // `DisplayOrientedMeteringPointFactory(display, cameraInfo, width, height)`：
+        // 它按 Display 的旋转和相机朝向把 view 坐标换算到传感器坐标，
+        // **不需要 PreviewView** —— 正好适合我们自绘的取景器。
+        val factory = androidx.camera.core.DisplayOrientedMeteringPointFactory(
+            display,
+            c.cameraInfo,
+            viewW.toFloat(),
+            viewH.toFloat(),
+        )
+        val point = factory.createPoint(
+            nx.coerceIn(0f, 1f) * viewW,
+            ny.coerceIn(0f, 1f) * viewH,
+        )
+        val action = FocusMeteringAction.Builder(
+            point,
+            FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE,
+        ).setAutoCancelDuration(5, java.util.concurrent.TimeUnit.SECONDS).build()
+        return runCatching {
+            c.cameraControl.startFocusAndMetering(action).get().isFocusSuccessful
+        }.getOrDefault(false)
+    }
+
+    /**
+     * 手动对焦距离（屈光度，0 = 无穷远，越大越近）。
+     *
+     * 走 Camera2 的 `LENS_FOCUS_DISTANCE`，先关掉 AF 才生效。
+     * 传 null 交回自动对焦。
+     */
+    suspend fun setManualFocus(diopters: Float?): Boolean {
+        val c = camera ?: return false
+        return try {
+            val ext = Camera2CameraControl.from(c.cameraControl)
+            val b = CaptureRequestOptions.Builder()
+            if (diopters == null) {
+                b.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AF_MODE,
+                    CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+                )
+            } else {
+                b.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AF_MODE,
+                    CameraMetadata.CONTROL_AF_MODE_OFF,
+                )
+                // diopter -> 焦距(米) = 1/diopter；Camera2 要的是米。
+                val meters = if (diopters <= 0.01f) 0f else 1f / diopters
+                b.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, meters)
+            }
+            ext.setCaptureRequestOptions(b.build()).get()
+            Log.d(TAG, "manual focus diopters=$diopters")
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "setManualFocus failed", e)
+            false
+        }
+    }
+
+    /** 最近对焦距离（屈光度上界），用于手动对焦滑杆的量程。 */
+    fun minFocusDiopters(): Float {
+        val info = camera?.cameraInfo ?: return 0f
+        val d: Float = runCatching {
+            androidx.camera.camera2.interop.Camera2CameraInfo.from(info)
+                .getCameraCharacteristic(
+                    android.hardware.camera2.CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE,
+                )
+        }.getOrNull() ?: return 0f
+        return d
     }
 
     /**
@@ -670,7 +882,10 @@ class CameraController(private val context: Context) {
     }
 
     /** 拍一张直接存到图库（不走测量）。 */
-    suspend fun captureToGallery(): Boolean {
+    suspend fun captureToGallery(
+        watermark: Watermark = Watermark(),
+        location: String? = null,
+    ): Boolean {
         val capture = imageCapture ?: return false
         val resolver = context.contentResolver
         val name = "LightYear_" + java.text.SimpleDateFormat(
@@ -689,25 +904,73 @@ class CameraController(private val context: Context) {
 
         return try {
             kotlinx.coroutines.suspendCancellableCoroutine { cont ->
-                val options = ImageCapture.OutputFileOptions.Builder(target.stream).build()
-                capture.takePicture(
-                    options,
-                    mainExecutor,
-                    object : ImageCapture.OnImageSavedCallback {
-                        override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                            target.close()
-                            MediaStoreOutput.publishPhoto(resolver, target.uri)
-                            if (cont.isActive) cont.resume(true)
-                        }
+                // 水印开启时走"内存拿位图 → 合成 → 写流"，否则走原来的直写流。
+                //
+                // 为什么不在 CameraX 的回调里直接写流：水印需要完整位图才能
+                // 排版（要知道画布宽高），而 onImageSaved 给的是已经落盘的
+                // 字节流，拿不到尺寸。
+                if (watermark.enabled) {
+                    capture.takePicture(
+                        mainExecutor,
+                        object : ImageCapture.OnImageCapturedCallback() {
+                            override fun onCaptureSuccess(image: ImageProxy) {
+                                try {
+                                    val bmp = FrameDecoder.imageProxyToBitmap(image)
+                                    // 时间在这里取一次，预览和成片共用 —— 否则
+                                    // 会出现"预览 12:30、成片 12:29"的差一秒问题。
+                                    val content = WatermarkContent.now(watermark, location)
+                                    val stamped = WatermarkRenderer.draw(bmp, watermark, content)
+                                    val ok = runCatching {
+                                        target.stream.use { s ->
+                                            stamped.compress(
+                                                android.graphics.Bitmap.CompressFormat.JPEG,
+                                                95,
+                                                s,
+                                            )
+                                        }
+                                    }.getOrDefault(false)
+                                    if (ok) MediaStoreOutput.publishPhoto(resolver, target.uri)
+                                    else MediaStoreOutput.deletePhoto(resolver, target.uri)
+                                    if (cont.isActive) cont.resume(ok)
+                                } catch (t: Throwable) {
+                                    Log.e(TAG, "watermark photo failed", t)
+                                    runCatching { target.close() }
+                                    MediaStoreOutput.deletePhoto(resolver, target.uri)
+                                    if (cont.isActive) cont.resume(false)
+                                } finally {
+                                    image.close()
+                                }
+                            }
 
-                        override fun onError(exception: ImageCaptureException) {
-                            Log.e(TAG, "save photo failed", exception)
-                            target.close()
-                            MediaStoreOutput.deletePhoto(resolver, target.uri)
-                            if (cont.isActive) cont.resume(false)
-                        }
-                    },
-                )
+                            override fun onError(exception: ImageCaptureException) {
+                                Log.e(TAG, "capture for watermark failed", exception)
+                                runCatching { target.close() }
+                                MediaStoreOutput.deletePhoto(resolver, target.uri)
+                                if (cont.isActive) cont.resume(false)
+                            }
+                        },
+                    )
+                } else {
+                    val options = ImageCapture.OutputFileOptions.Builder(target.stream).build()
+                    capture.takePicture(
+                        options,
+                        mainExecutor,
+                        object : ImageCapture.OnImageSavedCallback {
+                            override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                                target.close()
+                                MediaStoreOutput.publishPhoto(resolver, target.uri)
+                                if (cont.isActive) cont.resume(true)
+                            }
+
+                            override fun onError(exception: ImageCaptureException) {
+                                Log.e(TAG, "save photo failed", exception)
+                                target.close()
+                                MediaStoreOutput.deletePhoto(resolver, target.uri)
+                                if (cont.isActive) cont.resume(false)
+                            }
+                        },
+                    )
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "captureToGallery failed", e)
@@ -935,6 +1198,55 @@ class CameraController(private val context: Context) {
     }
 
     /**
+     * 设备朝向变化时更新 targetRotation。
+     *
+     * ## 为什么必须做这一步
+     *
+     * 横屏时 UI 会重排（控制条移到右侧），但**相机流不会自己转**：
+     * `Preview`/`ImageCapture`/`VideoCapture` 的 `targetRotation` 是在
+     * `bind()` 时定下的，绑定后不随设备转动更新。结果是横屏下 UI 转过去了、
+     * 画面内容还躺在竖屏方向 —— 看起来就是"画面转了 90°"。
+     *
+     * CameraX 提供 `targetRotation` 的 setter，改它会触发一次内部重配置，
+     * **不需要重建 use case**，所以取景器不会黑。这是官方推荐的做法。
+     *
+     * @return 是否真的改了（用于日志）
+     */
+    fun updateTargetRotation(rotation: Int): Boolean {
+        var changed = false
+        runCatching {
+            if (preview?.targetRotation != rotation) {
+                preview?.targetRotation = rotation
+                changed = true
+            }
+            if (imageCapture?.targetRotation != rotation) {
+                imageCapture?.targetRotation = rotation
+                changed = true
+            }
+            if (videoCapture?.targetRotation != rotation) {
+                videoCapture?.targetRotation = rotation
+                changed = true
+            }
+        }.onFailure { Log.w(TAG, "updateTargetRotation($rotation) failed", it) }
+
+        // 不要自己算角度塞给渲染器。
+        //
+        // 实测教训：横屏时 `TransformationInfo.rotationDegrees` 返回 180°，
+        // 而不是直觉上的 270°。原因是 CameraX 已经把传感器朝向那部分旋转
+        // 编进 `getTransformMatrix()` 的矩阵里了，`rotationDegrees` 只是
+        // "矩阵之外还要再转多少"。手工把 ROTATION_270 换算成 270° 塞进去，
+        // 结果是多转一次 —— 画面既旋转 90° 又上下颠倒。
+        //
+        // 正确做法：改完 use case 的 targetRotation 后，CameraX 会重新发
+        // TransformationInfo，渲染器按它转即可。这里只需要清掉可能存在的
+        // 手工覆盖，让渲染器回到"完全信任 CameraX"的状态。
+        filterProcessor?.targetRotationDegrees = 0
+
+        if (changed) Log.i(TAG, "targetRotation -> $rotation")
+        return changed
+    }
+
+    /**
      * 设备能力快照：变焦范围与曝光补偿范围。
      *
      * 只有在 [bind] 返回之后取才有意义 —— 绑定是协程，`camera` 在其末尾才赋值。
@@ -951,6 +1263,10 @@ class CameraController(private val context: Context) {
         val exposureStepEv: Double = 1.0 / 3.0,
         /** 设备有超广角相机，但 CameraX 没暴露它 —— UI 要说明原因。 */
         val ultraWideBlocked: Boolean = false,
+        /** 超广角物理相机可用（能真的切换）。 */
+        val ultraWideAvailable: Boolean = false,
+        /** 最近对焦距离（屈光度），0 表示不支持手动对焦。 */
+        val minFocusDiopters: Float = 0f,
     )
 
     fun release() {

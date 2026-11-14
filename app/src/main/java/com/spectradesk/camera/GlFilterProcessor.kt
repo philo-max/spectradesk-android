@@ -123,6 +123,57 @@ class GlFilterProcessor : SurfaceProcessor {
     @Volatile
     var mirror: Boolean = false
 
+    /**
+     * 还要再转多少度画面才是正的。
+     *
+     * 来自 `SurfaceRequest.TransformationInfo.getRotationDegrees()`。
+     *
+     * ## 为什么必须有这个
+     *
+     * `SurfaceTexture.getTransformMatrix()` 只描述**缓冲区到纹理**的映射，
+     * 它不知道传感器是怎么装的。实测这台 vivo：
+     *
+     * ```
+     * 后置 sensor.orientation = 90
+     * 前置 sensor.orientation = 270
+     * ```
+     *
+     * 前置比后置多 180°。只靠 SurfaceTexture 矩阵，前置就会画成倒的 ——
+     * 这正是"前置是倒置的"的根因。TransformationInfo 给出的角度已经包含
+     * targetRotation 与传感器朝向的差值，直接转就行。
+     */
+    @Volatile
+    private var rotationDegrees: Int = 0
+
+    /**
+     * 由外部设置的目标旋转（度）。
+     *
+     * ## 为什么这个覆盖要慎用
+     *
+     * 实测发现：`TransformationInfo.rotationDegrees` 在横屏下返回的是
+     * **180°**（不是 270°）。原因是 CameraX 已经在 `getTransformMatrix()`
+     * 返回的矩阵里包含了传感器朝向那部分旋转，`rotationDegrees` 只表示
+     * "在矩阵之外还要再转多少"。
+     *
+     * 所以**不能**把 `Surface.ROTATION_*` 直接换算成度塞进来 —— 那会
+     * 多转一次，画面就歪了（实测转 270° 后画面上下颠倒且旋转 90°）。
+     *
+     * 这个字段保留为 0 表示"完全信任 CameraX"，只在极端情况下
+     * （CameraX 给的矩阵确实不含旋转）才需要手工干预。
+     */
+    @Volatile
+    var targetRotationDegrees: Int = 0
+        set(value) {
+            if (field != value) {
+                field = value
+                Log.i(TAG, "targetRotationDegrees -> $value (override)")
+            }
+        }
+
+    /** 实际用于渲染的旋转角：外部覆盖优先，否则用 CameraX 给的。 */
+    private fun effectiveRotation(): Int =
+        if (targetRotationDegrees != 0) targetRotationDegrees else rotationDegrees
+
     private val glThread = HandlerThread("gl-filter").apply { start() }
     private val glHandler = Handler(glThread.looper)
     private val glExecutor = Executor { glHandler.post(it) }
@@ -160,6 +211,7 @@ class GlFilterProcessor : SurfaceProcessor {
     private var uViewSizeLoc = 0
     private var uFrameSizeLoc = 0
     private var uMirrorLoc = 0
+    private var uRotateLoc = 0
     private var uFilterLoc = 0
     private var uIntensityLoc = 0
     private var uGradeOnLoc = 0
@@ -228,8 +280,23 @@ class GlFilterProcessor : SurfaceProcessor {
 
                 val surface = Surface(st)
                 previewInputSurface = surface
+
+                // 拿 CameraX 算好的旋转角。这是前置倒置的根治点：
+                // SurfaceTexture 矩阵只管缓冲区映射，不含"传感器装反 180°"
+                // 这条信息（前置 orientation=270、后置=90，差 180°）。
+                request.setTransformationInfoListener(glExecutor) { info ->
+                    val deg = info.rotationDegrees
+                    if (deg != rotationDegrees) {
+                        rotationDegrees = deg
+                        Log.i(TAG, "preview rotation = $deg° (mirror=${info.isMirroring})")
+                    }
+                }
+
                 request.provideSurface(surface, glExecutor) {
-                    glExecutor.execute { releasePreviewInput() }
+                    glExecutor.execute {
+                        request.clearTransformationInfoListener()
+                        releasePreviewInput()
+                    }
                 }
                 Log.i(TAG, "preview input ${size.width}x${size.height}")
             } catch (t: Throwable) {
@@ -253,8 +320,17 @@ class GlFilterProcessor : SurfaceProcessor {
         }
         try {
             st.updateTexImage()
-            // 预览没有 CameraX 的裁剪信息（这是我们自己的输入），
-            // 所以只做 SurfaceTexture 自带的方向变换，其余交给 shader 的填充裁剪。
+            // 预览的方向要由 CameraX 的 TransformationInfo 给出，不能只靠
+            // SurfaceTexture 自带的矩阵。
+            //
+            // `getTransformMatrix` 只包含**缓冲区到纹理**的映射（比如传感器
+            // 读出顺序），它不知道这颗传感器装反了 180°。实测这台机器：
+            //   后置 sensor.orientation = 90
+            //   前置 sensor.orientation = 270
+            // 前置比后置多 180°，只靠 SurfaceTexture 矩阵就会把前置画成倒的。
+            //
+            // `TransformationInfo.getRotationDegrees()` 是 CameraX 算好的
+            // 「还要再转多少度才正」，包含 targetRotation 与传感器朝向的差值。
             st.getTransformMatrix(transform)
             System.arraycopy(transform, 0, updatedTransform, 0, 16)
             drawTo(listOf(egl), previewTextureId, target, st.timestamp)
@@ -424,11 +500,17 @@ class GlFilterProcessor : SurfaceProcessor {
             // 传**旋转之后**的帧尺寸：u_matrix 常含 90° 旋转（横拍的传感器帧
             // 转成竖屏显示），旋转后纵横比会倒过来。用未旋转的尺寸算填充裁剪
             // 会让画面被拉长 —— 这正是上一版变形的原因。
-            val rotated = isQuarterTurn(updatedTransform)
+            //
+            // 还要算上 CameraX 给的角度：90/270 也要换宽高，180 不换。
+            val rot = effectiveRotation()
+            val matrixTurn = isQuarterTurn(updatedTransform)
+            val cameraTurn = (rot / 90) % 2 == 1
+            val rotated = matrixTurn != cameraTurn
             val aw = if (rotated) frameH else frameW
             val ah = if (rotated) frameW else frameH
             GLES20.glUniform2f(uFrameSizeLoc, aw.toFloat(), ah.toFloat())
             GLES20.glUniform1f(uMirrorLoc, if (mirror) 1f else 0f)
+            GLES20.glUniform1f(uRotateLoc, Math.toRadians(rot.toDouble()).toFloat())
             GLES20.glUniform1i(uFilterLoc, filter.ordinal)
             GLES20.glUniform1f(uIntensityLoc, intensity)
 
@@ -559,6 +641,7 @@ class GlFilterProcessor : SurfaceProcessor {
         uViewSizeLoc = GLES20.glGetUniformLocation(program, "u_viewSize")
         uFrameSizeLoc = GLES20.glGetUniformLocation(program, "u_frameSize")
         uMirrorLoc = GLES20.glGetUniformLocation(program, "u_mirror")
+        uRotateLoc = GLES20.glGetUniformLocation(program, "u_rotate")
         uFilterLoc = GLES20.glGetUniformLocation(program, "u_filter")
         uIntensityLoc = GLES20.glGetUniformLocation(program, "u_intensity")
         uGradeOnLoc = GLES20.glGetUniformLocation(program, "u_gradeOn")
@@ -736,10 +819,27 @@ class GlFilterProcessor : SurfaceProcessor {
         uniform vec2 u_viewSize;     // 取景器实际像素尺寸
         uniform vec2 u_frameSize;    // 相机输入帧像素尺寸
         uniform float u_mirror;      // 1.0 = 水平镜像（前置自拍）
+        uniform float u_rotate;      // 弧度，来自 TransformationInfo
         varying vec2 v_texCoord;
         void main() {
             gl_Position = a_position;
             vec2 uv = (u_matrix * a_texCoord).xy;
+
+            // 旋转：CameraX 告诉我们"还要再转多少度才正"。
+            //
+            // 在 uv 空间绕中心旋转（不是在顶点位置上转）。
+            //
+            // 为什么：`u_matrix` 已经把传感器帧映射到正确的纹理方向，
+            // 我们只需要在采样坐标上补 CameraX 说的那点角度。
+            // 曾经试过把旋转作用在 gl_Position 上，结果竖屏下画面被压成
+            // 一条窄带（顶点转了但视口没变），所以回到 uv 方案。
+            if (u_rotate != 0.0) {
+                vec2 c = uv - 0.5;
+                float s = sin(u_rotate);
+                float co = cos(u_rotate);
+                uv = vec2(c.x * co - c.y * s, c.x * s + c.y * co) + 0.5;
+            }
+
             if (u_mirror > 0.5) uv.x = 1.0 - uv.x;
 
             // 中心裁剪填满取景框（等比，不拉伸）。

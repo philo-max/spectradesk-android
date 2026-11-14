@@ -19,6 +19,25 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.SpectraDesk">
 
+        <!--
+          锁竖屏。
+
+          ## 为什么回退到 portrait
+
+          试过 `fullUser` + 传感器驱动重排，结果不成立：CameraX 的
+          `SurfaceProcessor` 输出是固定朝向的 EGL 缓冲，我们的取景器
+          SurfaceView 尺寸跟着 Compose 布局走。横屏时两者方向不一致，
+          GL 需要在 shader 里补旋转；而 `getTransformMatrix()` 里**已经
+          含有一份旋转**，再补一次就是转两遍 —— 实测画面既转了 90°
+          又上下颠倒，退回竖屏后还会残留错误的布局状态。
+
+          要正确支持横屏，需要把整条 GL 管线改成"按 targetRotation 重建
+          输入 Surface"（而不是在 shader 里补转），这是一次结构性改动，
+          不在本轮范围内。锁竖屏是诚实的做法：功能可用、行为可预期。
+
+          相机本身仍然能拍横向构图 —— 手持横拍时，重力传感器会把
+          targetRotation 更新成 90/270，照片的 EXIF 方向是对的。
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"

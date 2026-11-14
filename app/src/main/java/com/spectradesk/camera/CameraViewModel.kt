@@ -37,6 +37,11 @@ data class UiState(
     val paramsOpen: Boolean = false,
     /** 是否显示实时滤镜（关掉可对比原图）。 */
     val liveFilterOn: Boolean = true,
+    /** 设备物理朝向，驱动横竖屏自适应。 */
+    val orientation: OrientationTracker.DeviceOrientation =
+        OrientationTracker.DeviceOrientation.PORTRAIT,
+    /** 最近一次点按对焦的位置（归一化），用于画对焦框。null = 不显示。 */
+    val focusPoint: Pair<Float, Float>? = null,
 ) {
     val activeStandard: ColorStandard?
         get() = activeStandardName?.let { Standards.byName(it) }
@@ -280,6 +285,53 @@ class CameraViewModel : ViewModel() {
             else it.copy(
                 settings = it.settings.copy(frameAspect = aspect),
                 message = "画幅已切到 ${aspect.label}",
+            )
+        }
+    }
+
+    /** 超广角开关。切换物理相机，不重建管线。 */
+    fun setUltraWide(on: Boolean) {
+        _state.update {
+            it.copy(
+                settings = it.settings.copy(ultraWide = on),
+                message = if (on) "超广角已开" else "已回到主摄",
+            )
+        }
+    }
+
+    /** 手动对焦；null 交回自动。 */
+    fun setManualFocus(diopters: Float?) {
+        _state.update { it.copy(settings = it.settings.copy(manualFocus = diopters)) }
+    }
+
+    /** 水印：整体开关。 */
+    fun setWatermarkEnabled(on: Boolean) {
+        _state.update {
+            it.copy(
+                settings = it.settings.copy(watermark = it.settings.watermark.copy(enabled = on)),
+                message = if (on) "水印已开" else "水印已关",
+            )
+        }
+    }
+
+    /** 水印：改任意字段。 */
+    fun updateWatermark(block: (Watermark) -> Watermark) {
+        _state.update {
+            it.copy(settings = it.settings.copy(watermark = block(it.settings.watermark)))
+        }
+    }
+
+    /** 设备朝向变化，驱动横竖屏自适应。 */
+    fun setOrientation(o: OrientationTracker.DeviceOrientation) {
+        _state.update { if (it.orientation == o) it else it.copy(orientation = o) }
+    }
+
+    /** 点按对焦的结果提示。 */
+    fun reportFocus(ok: Boolean, x: Float, y: Float) {
+        _state.update {
+            it.copy(
+                focusPoint = if (ok) x to y else null,
+                message = if (ok) null else "对焦未成功（可能太近或光线不足）",
             )
         }
     }

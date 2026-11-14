@@ -68,6 +68,12 @@ data class CameraSettings(
      * 应用最容易被投诉的那类问题。
      */
     val frameAspect: FrameAspect = FrameAspect.RATIO_16_9,
+    /** 水印。默认关闭，用户主动开。 */
+    val watermark: Watermark = Watermark(),
+    /** 超广角（物理相机切换），只在设备有这颗镜头时可用。 */
+    val ultraWide: Boolean = false,
+    /** 手动对焦屈光度；null = 自动对焦。 */
+    val manualFocus: Float? = null,
 ) {
     fun gammaLabel(): String =
         if (gammaCorrected) "GC 开 · sRGB→线性" else "GC 关 · 按线性处理"

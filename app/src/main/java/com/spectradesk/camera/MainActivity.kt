@@ -285,7 +285,7 @@ fun CameraScreen(controller: CameraController?) {
         scope.launch {
             vm.setBusy(true)
             try {
-                val ok = c.captureToGallery()
+                val ok = c.captureToGallery(state.settings.watermark)
                 vm.message(if (ok) "已保存到相册 · Pictures/LightYear" else "保存失败")
             } catch (e: Exception) {
                 vm.message("拍摄失败：${e.message}")
@@ -448,6 +448,10 @@ fun CameraScreen(controller: CameraController?) {
                         onIntensity = { vm.setFilterIntensity(it) },
                         onAudio = { vm.setAudioEnabled(it) },
                         onGamma = vm::setGammaCorrected,
+                onUltraWide = { vm.setUltraWide(it) },
+                onManualFocus = { vm.setManualFocus(it) },
+                onWatermarkEnabled = { vm.setWatermarkEnabled(it) },
+                onWatermark = { block -> vm.updateWatermark(block) },
                         onClampExposure = { vm.clampExposureIndex(it) },
                         onGradeChannel = { ch, v -> vm.setGradeChannel(ch, v) },
                         onGradePreset = { vm.applyGradePreset(it) },
@@ -607,6 +611,10 @@ private fun ParamsPanel(
     onGradePreset: (String) -> Unit,
     onGradeReset: () -> Unit,
     onFrameAspect: (FrameAspect) -> Unit,
+    onUltraWide: (Boolean) -> Unit,
+    onManualFocus: (Float?) -> Unit,
+    onWatermarkEnabled: (Boolean) -> Unit,
+    onWatermark: ((Watermark) -> Watermark) -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
 
@@ -810,7 +818,186 @@ private fun ParamsPanel(
 
         HorizontalDivider(Modifier.padding(vertical = 8.dp), color = colors.outlineVariant)
 
-        // ── 调色（参考剪映/醒图的「调节」分项）─────────────────────────
+        // ── 镜头与对焦 ──────────────────────────────────────────────
+
+        // 超广角：切物理相机。设备没有这颗镜头时开关禁用并说明原因。
+        Row(
+            Modifier.fillMaxWidth().padding(vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("超广角", color = colors.onSurface, style = MaterialTheme.typography.labelMedium)
+                Text(
+                    when {
+                        caps == null -> "相机未绑定"
+                        caps.ultraWideAvailable -> "切换物理镜头"
+                        else -> "此设备未暴露超广角物理相机"
+                    },
+                    color = colors.onSurfaceVariant,
+                    style = MonoSmall,
+                )
+            }
+            Switch(
+                checked = state.settings.ultraWide,
+                onCheckedChange = onUltraWide,
+                enabled = caps?.ultraWideAvailable == true,
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = colors.onPrimary,
+                    checkedTrackColor = colors.primary,
+                ),
+            )
+        }
+
+        // 手动对焦：0 = 无穷远，越大越近。范围由设备最近对焦距离决定。
+        ParamRow(
+            label = "对焦",
+            value = state.settings.manualFocus?.let { "%.2f 屈光度".format(it) } ?: "自动",
+        ) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                val maxD = caps?.minFocusDiopters ?: 0f
+                if (maxD > 0.01f) {
+                    Slider(
+                        value = state.settings.manualFocus ?: 0f,
+                        onValueChange = { onManualFocus(if (it < 0.005f) null else it) },
+                        valueRange = 0f..maxD,
+                        colors = sliderColors(colors),
+                        modifier = Modifier.weight(1f).height(28.dp),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Box(
+                        Modifier
+                            .clip(ChipShape)
+                            .background(colors.surfaceVariant)
+                            .clickable { onManualFocus(null) }
+                            .padding(horizontal = 10.dp, vertical = 5.dp),
+                    ) {
+                        Text("AF", color = colors.onSurfaceVariant, style = MonoSmall)
+                    }
+                } else {
+                    Text(
+                        "不支持手动对焦（点按取景器仍可对焦）",
+                        color = colors.onSurfaceVariant,
+                        style = MonoSmall,
+                    )
+                }
+            }
+        }
+
+        // ── 水印 ────────────────────────────────────────────────────
+        HorizontalDivider(Modifier.padding(vertical = 8.dp), color = colors.outlineVariant)
+
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("水印", color = colors.onSurface, style = MaterialTheme.typography.labelMedium)
+                Text(
+                    if (state.settings.watermark.enabled) "拍照时合成进照片" else "关闭时不加水印",
+                    color = colors.onSurfaceVariant,
+                    style = MonoSmall,
+                )
+            }
+            Switch(
+                checked = state.settings.watermark.enabled,
+                onCheckedChange = onWatermarkEnabled,
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = colors.onPrimary,
+                    checkedTrackColor = colors.primary,
+                ),
+            )
+        }
+
+        if (state.settings.watermark.enabled) {
+            val wm = state.settings.watermark
+            // 位置：四角。
+            Row(
+                Modifier.fillMaxWidth().padding(top = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Watermark.Corner.entries.forEach { c ->
+                    val active = wm.corner == c
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .clip(ChipShape)
+                            .background(if (active) colors.primary else colors.surfaceVariant)
+                            .clickable { onWatermark { it.copy(corner = c) } }
+                            .padding(vertical = 5.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            c.label,
+                            color = if (active) colors.onPrimary else colors.onSurfaceVariant,
+                            style = MonoSmall,
+                        )
+                    }
+                }
+            }
+            // 版式：简洁 / 卡片。
+            Row(
+                Modifier.fillMaxWidth().padding(top = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Watermark.Style.entries.forEach { st ->
+                    val active = wm.style == st
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .clip(ChipShape)
+                            .background(if (active) colors.secondary else colors.surfaceVariant)
+                            .clickable { onWatermark { it.copy(style = st) } }
+                            .padding(vertical = 5.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            st.label,
+                            color = if (active) colors.onSecondary else colors.onSurfaceVariant,
+                            style = MonoSmall,
+                        )
+                    }
+                }
+            }
+            // 字段开关。
+            Row(
+                Modifier.fillMaxWidth().padding(top = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                listOf("时间" to wm.showTime, "地点" to wm.showLocation, "文字" to wm.showCustom)
+                    .forEach { (label, on) ->
+                        Box(
+                            Modifier
+                                .weight(1f)
+                                .clip(ChipShape)
+                                .background(if (on) colors.tertiary else colors.surfaceVariant)
+                                .clickable {
+                                    onWatermark {
+                                        when (label) {
+                                            "时间" -> it.copy(showTime = !it.showTime)
+                                            "地点" -> it.copy(showLocation = !it.showLocation)
+                                            else -> it.copy(showCustom = !it.showCustom)
+                                        }
+                                    }
+                                }
+                                .padding(vertical = 5.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                label,
+                                color = if (on) colors.onTertiary else colors.onSurfaceVariant,
+                                style = MonoSmall,
+                            )
+                        }
+                    }
+            }
+            androidx.compose.material3.OutlinedTextField(
+                value = wm.customText,
+                onValueChange = { t -> onWatermark { it.copy(customText = t.take(24)) } },
+                label = { Text("自定义文字", style = MonoSmall) },
+                singleLine = true,
+                textStyle = MonoSmall,
+                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+            )
+        }
+
+        HorizontalDivider(Modifier.padding(vertical = 8.dp), color = colors.outlineVariant)
         //
         // 为什么和上面的参数分开：上面那些改的是**相机**（变焦、曝光、GC），
         // 会改变物理条件甚至清掉标定；这里改的是**画面**，纯显示变换，

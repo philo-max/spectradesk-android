@@ -31,14 +31,18 @@ spectradesk-android/
 | 实时滤镜 | ✅ | 8 种观感，GPU 片元着色器，30 fps |
 | 滤镜强度 | ✅ | 0–100% 连续可调，实时生效 |
 | **手动调色** | ✅ | 10 项滑杆 + 7 个预设，参考剪映/醒图 |
-| **前后置切换** | ✅ | 一键切换，前置自动镜像 |
+| **前后置切换** | ✅ | 一键切换，前置自动镜像，方向已修正 |
 | **画幅比例** | ✅ | 16:9 / 4:3，取景器+预览+照片三者同比例 |
+| **水印** | ✅ | 四角/版式/字段可选，合成进 JPEG |
+| **点按对焦** | ✅ | 点取景器任意位置对焦，显示对焦框 |
+| **手动对焦** | ✅ | 屈光度滑杆，设备支持时可用 |
 | 拍照 | ✅ | 16:9 或 4:3，存入相册 `Pictures/LightYear` |
 | 录像 | ✅ | H.264 MP4，1080×1920，存入 `Movies/LightYear` |
 | 录音 | ✅ | 可开关；未授权时静默降级为无声录像 |
 | 变焦 | ✅ | 滑杆 + 快捷档位（0.6/1/2/3/5/10×） |
 | 曝光补偿 | ✅ | ±EV，步长按设备实测（这台是 1/10 EV） |
-| 参数面板 | ✅ | 浮层 + 可滚动，不挤压取景器 |
+| 超广角 | ⚠️ | 代码已实现，但这台 vivo 未向三方暴露该相机 |
+| 横竖屏自适应 | ⚠️ | 界面锁竖屏；横拍时照片 EXIF 方向正确，见第七节 |
 
 实测截图：
 
@@ -52,11 +56,11 @@ spectradesk-android/
 |---|---|---|
 | ![169](screenshots/lightyear-30-16x9.png) | ![43](screenshots/lightyear-31-4x3.png) | ![front](screenshots/lightyear-32-front-live.png) |
 
-调色效果是**实时**的，且**烧进视频**：
+水印：预览是 overlay，存盘时用同一套几何合成进 JPEG：
 
-| 调色后的取景器 | 从录制视频抽帧 |
+| 取景器里的水印预览 | 成片（水印已烧进像素） |
 |---|---|
-| ![grade](screenshots/lightyear-22-grade-live.png) | ![video](screenshots/lightyear-24-video-graded.png) |
+| ![wm preview](screenshots/lightyear-41-watermark-preview.png) | ![wm photo](screenshots/lightyear-40-watermark-photo.jpg) |
 
 **滤镜确实烧进了视频**，不是只在取景器里做样子。从录好的 MP4 抽帧：
 
@@ -293,41 +297,86 @@ $emu = "$env:LOCALAPPDATA\Android\Sdk\emulator\emulator.exe"
   锁失败时右上角会显示「曝光未锁」，不会假装成功。
 - **只有后置/前置两路**，没有 RAW、没有手电筒常亮。
 - **0–1 区间（超广角）变焦拿不到 —— 这是平台限制，不是没做。** 详见下节。
+- **横屏自适应未完成**，界面锁竖屏。详见下节。
 - **历史只在内存**，进程被杀即丢失。
 - **变焦/曝光补偿依赖设备能力**，不支持的设备上滑块会显示提示而不是假装可用。
 
-### 为什么这台 vivo 没有 0.6× 超广角
+### 前置倒置的根因：SensorTexture 矩阵不含传感器朝向
 
-实测 vivo V2352A / Android 16 有 **8 个 camera device**，其中一颗后置逻辑相机
-`zoomRatioRange = [0.6, 10.0]`、`logicalMultiCamera.physicalIds = [3, 0]`
-（超广角 + 主摄）—— 硬件上确实有超广角。
+现象：切到前置，画面是倒的。
 
-但**第三方应用只能看到 2 个**：
+根因不是镜像方向，而是**少转了一次**。`SurfaceTexture.getTransformMatrix()`
+只描述"缓冲区→纹理"的映射，它**不知道传感器是怎么装的**。实测这台机器：
 
 ```
-CameraManager.cameraIdList  →  ["0", "1"]
-   id=0  facing=BACK   zoomRatioRange = 1.0..10.0
-   id=1  facing=FRONT  zoomRatioRange = 1.0..10.0
+后置 sensor.orientation = 90
+前置 sensor.orientation = 270     ← 差 180°
 ```
 
-`ProcessCameraProvider.getAvailableCameraInfos()` 同样只返回 2 个，
-`dumpsys media.camera` 的连接记录也只有 `device 0` / `device 1`。
-那颗 0.6 起的相机在 vivo 的私有 HAL 通道里，只对系统相机开放。
+前置比后置多 180°，只靠 SurfaceTexture 矩阵就会画成倒的。
 
-代码里两条路都试过了（`CameraSelector.addCameraFilter` 按 zoom 下限挑、
-`CameraManager` 枚举全部 cameraId 精确匹配），结论一致：**看不到就绑不上**。
-所以变焦滑杆的下界取 `zoomState.minZoomRatio` 而不是写死 1.0 ——
-换一台把超广角暴露出来的机器，0.6× 会直接出现在滑杆左端，不需要改代码。
+修法：用 CameraX 的 `SurfaceRequest.TransformationInfo.getRotationDegrees()`。
+它已经算好"还要再转多少度才正"，直接喂给 shader 的 `u_rotate` 即可：
+
+```kotlin
+request.setTransformationInfoListener(glExecutor) { info ->
+    rotationDegrees = info.rotationDegrees      // 后置 90°，前置 270°
+}
+```
+
+**注意不要自己把 `Surface.ROTATION_*` 换算成度数塞进去。** 实测横屏时
+`rotationDegrees` 返回 180°，而不是直觉上的 270° —— 因为 CameraX 已经把
+一部分旋转编进了 `getTransformMatrix()` 的矩阵里。自己再算一遍就是转两次，
+画面会既转 90° 又上下颠倒。
+
+### 为什么横屏自适应没做成
+
+试过三条路，都不成立，所以这一版诚实锁竖屏：
+
+| 尝试 | 结果 |
+|---|---|
+| UI 随传感器重排（控制条移到右侧） | 取景器是自绘 SurfaceView，EGL 缓冲尺寸跟着 Compose 布局走，而 `SurfaceProcessor` 输出朝向固定。两者不一致，GL 必须补旋转，但矩阵里已含一份 → 转两遍 |
+| 只在 shader 里补旋转 | 同上，横屏画面转 90° 且上下颠倒 |
+| 只改 `targetRotation` 让 CameraX 重配 | 更糟：CameraX 把输出缓冲改成横向（实测 1163×2067 → 882×496），而我们锁了竖屏，画面被压成一条横带，连竖屏都回不去 |
+
+要真正支持，得把 GL 管线改成"按 `targetRotation` 重建输入 SurfaceTexture"，
+而不是在 shader 里补转 —— 那是结构性改动，需要重写 `GlFilterProcessor` 的
+输入生命周期。`OrientationTracker.kt` 已经写好并保留，下一轮直接接上即可。
+
+**横构图仍然能拍**：手持横拍时照片按传感器方向写入 EXIF，相册里会正确
+横过来显示。缺的只是"取景界面本身横过来"。
+
+### 超广角：代码已实现，但这台设备不暴露
+
+`findUltraWidePhysicalId()` 走的是 `CameraCharacteristics.getPhysicalCameraIds()`
+＋按焦距挑最短的那颗（主摄 4.84mm / 超广角 1.66mm），然后通过
+`availablePhysicalCameraRequestKeys` 里的 `PHYSICAL_CAMERA_ID` 切换。
+
+但实测这台 vivo：
+
+```
+cameraIdList            → ["0", "1"]          （只有两个逻辑相机）
+getPhysicalCameraIds()  → 空集                 （不暴露物理子相机）
+dumpsys physicalIds     → [3 0]               （metadata 里有，API 拿不到）
+zoomRatioRange          → 0.6..10.0 确实存在于某个 device
+```
+
+也就是说硬件有超广角、系统相机能用，但 HAL 没有通过标准 API 暴露给三方应用。
+代码在支持的机型上会直接生效（面板里的开关会自动可用），这台机器上会显示
+"此设备未暴露超广角物理相机"。
 
 ## 八、下一步
 
-1. **准星与采样区对齐**：`UseCaseGroup` + `ViewPort` 共享视口，这是目前最明显的
+1. **横屏自适应（结构性）**：把 `GlFilterProcessor` 的输入改成按
+   `targetRotation` 重建 SurfaceTexture，而不是在 shader 里补转。
+   `OrientationTracker` 已就绪。
+2. **准星与采样区对齐**：`UseCaseGroup` + `ViewPort` 共享视口，这是目前最明显的
    精度隐患——框住的区域和被采样的区域必须严格是同一块。
-2. **3D LUT 滤镜**：现在的 8 种观感是解析式（数学公式）。真实相机 App 用
+3. **3D LUT 滤镜**：现在的 8 种观感是解析式（数学公式）。真实相机 App 用
    33³ 或 17³ 的 LUT 文件（InstaShot 和 Google Photos 都是），
    `LiveFilters.sampleLut` 已经写好三线性插值，接文件即可。
-3. **RAW/DNG**：走 RAW 能绕开厂商 ISP 的调色，这是唯一能接近「真实测量」的路。
-4. **多点平均**：现在只取中心一块；改成 3×3 多点取中位数能进一步降噪。
-5. **标定卡**：印一张已知色块卡，App 自动识别并做多点校正，能部分补偿
+4. **RAW/DNG**：走 RAW 能绕开厂商 ISP 的调色，这是唯一能接近「真实测量」的路。
+5. **多点平均**：现在只取中心一块；改成 3×3 多点取中位数能进一步降噪。
+6. **标定卡**：印一张已知色块卡，App 自动识别并做多点校正，能部分补偿
    手机相机非理想的光谱响应。
-6. **网格线 / 画幅比例 / 定时器**：参考应用都有的取景辅助，下一步补齐。
+7. **网格线 / 定时器**：参考应用都有的取景辅助，下一步补齐。
