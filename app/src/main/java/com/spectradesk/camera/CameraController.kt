@@ -241,6 +241,32 @@ class CameraController(private val context: Context) {
         imageCapture = capture
         videoCapture = video
 
+        // 告诉渲染器预览需要补多少旋转。
+        //
+        // 预览没有 SurfaceOutput（我们自己当 SurfaceProvider），拿不到
+        // CameraX 的权威变换，只能用 Camera2 的标准公式自己算：
+        //   后置：(sensorOrientation - displayDegrees + 360) % 360
+        //   前置：(sensorOrientation + displayDegrees) % 360，再镜像
+        //
+        // 传感器方向从 Camera2 特性读；显示方向来自 display.rotation。
+        val sensorOrientation = runCatching {
+            androidx.camera.camera2.interop.Camera2CameraInfo.from(camera!!.cameraInfo)
+                .getCameraCharacteristic(
+                    android.hardware.camera2.CameraCharacteristics.SENSOR_ORIENTATION,
+                )
+        }.getOrNull() ?: 90
+        val displayDegrees = when (displayRotation) {
+            android.view.Surface.ROTATION_90 -> 90
+            android.view.Surface.ROTATION_180 -> 180
+            android.view.Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+        processor.configurePreviewOrientation(
+            sensorOrientation = sensorOrientation,
+            displayDegrees = displayDegrees,
+            frontFacing = lensFacing == CameraSelector.LENS_FACING_FRONT,
+        )
+
         // 绑定完成、camera 已赋值，此时取能力才是真的。
         return capabilitySnapshot()
     }
@@ -1229,19 +1255,9 @@ class CameraController(private val context: Context) {
             }
         }.onFailure { Log.w(TAG, "updateTargetRotation($rotation) failed", it) }
 
-        // 不要自己算角度塞给渲染器。
-        //
-        // 实测教训：横屏时 `TransformationInfo.rotationDegrees` 返回 180°，
-        // 而不是直觉上的 270°。原因是 CameraX 已经把传感器朝向那部分旋转
-        // 编进 `getTransformMatrix()` 的矩阵里了，`rotationDegrees` 只是
-        // "矩阵之外还要再转多少"。手工把 ROTATION_270 换算成 270° 塞进去，
-        // 结果是多转一次 —— 画面既旋转 90° 又上下颠倒。
-        //
-        // 正确做法：改完 use case 的 targetRotation 后，CameraX 会重新发
-        // TransformationInfo，渲染器按它转即可。这里只需要清掉可能存在的
-        // 手工覆盖，让渲染器回到"完全信任 CameraX"的状态。
-        filterProcessor?.targetRotationDegrees = 0
-
+        // 渲染器不需要任何旋转参数 —— 方向全由 SurfaceTexture 矩阵决定。
+        // 改完 use case 的 targetRotation 后，CameraX 会重算矩阵，渲染器
+        // 下一帧自动跟上。
         if (changed) Log.i(TAG, "targetRotation -> $rotation")
         return changed
     }
