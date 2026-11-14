@@ -1,17 +1,32 @@
 package com.spectradesk.camera
 
+import android.Manifest
 import android.content.Context
-import android.util.Log
+import android.content.pm.PackageManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.util.Log
+import android.util.Range
 import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.CaptureRequestOptions
+import androidx.camera.core.CameraEffect
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.SurfaceProcessor
+import androidx.camera.core.UseCaseGroup
+import androidx.camera.core.ViewPort
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.FallbackStrategy
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
@@ -21,22 +36,18 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 /**
- * Thin wrapper over CameraX for preview + still capture.
+ * CameraX 封装：预览 + 实时滤镜 + 拍照 + 录像 + 参数控制。
  *
- * The wrapper exists for four reasons:
+ * 这个类存在有五个理由：
  *
- * * **Shutter semantics.**  `takePicture` is asynchronous and re-entrant; a
- *   double-tapped shutter must not start two overlapping captures with
- *   interleaved state.  [capture] returns `null` while one is in flight.
- * * **Cancellation.**  A cancelled coroutine must still release the image proxy,
- *   or the camera pipeline stalls after a few cancelled shots.
- * * **Determinism.**  Auto-exposure and auto-white-balance are not touched after
- *   binding: the reference and the sample must be measured under the same gains,
- *   or the division is meaningless.
- * * **Preview wiring.**  Binding a `Preview` use case to the `PreviewView`
- *   surface is easy to get subtly wrong (surface provider after bind, or a stale
- *   provider after rebind), and the failure looks like a black screen rather than
- *   an exception.
+ * * **快门语义。** `takePicture` 是异步且可重入的；双击快门不能开两次重叠的拍摄。
+ *   [capture] 在一次拍摄进行中返回 `null`。
+ * * **取消安全。** 被取消的协程仍必须释放 image proxy，否则拍几张之后管线卡死。
+ * * **确定性。** 绑定之后不碰自动曝光/自动白平衡：参考白和样品必须在同一组增益下测，
+ *   否则那个除法没有意义。
+ * * **单条管线。** 滤镜、预览、拍照、录像共享同一个 SurfaceProcessor 输出，所以
+ *   取景器里看到的、录进视频的、存成照片的是同一帧。三者不可能不一致。
+ * * **参数与测量分离。** 变焦、曝光补偿这些是"观感"控制，测量仍然只读未滤镜的中心区。
  */
 class CameraController(private val context: Context) {
 
@@ -47,89 +58,285 @@ class CameraController(private val context: Context) {
     private var provider: ProcessCameraProvider? = null
     private var imageCapture: ImageCapture? = null
     private var preview: Preview? = null
+    private var videoCapture: VideoCapture<Recorder>? = null
+    private var activeRecording: Recording? = null
     private val mainExecutor: Executor = ContextCompat.getMainExecutor(context)
+
+    /** 实时滤镜处理器。绑定期间非 null，解绑后释放。 */
+    private var filterProcessor: GlFilterProcessor? = null
+
+    /** 取景器视图，释放时要摘掉回调。 */
+    private var previewSurfaceView: PreviewSurfaceView? = null
 
     @Volatile
     private var capturing = false
 
     val isCapturing: Boolean get() = capturing
 
+    /** 当前是否在录像。 */
+    @Volatile
+    var isRecording: Boolean = false
+        private set
+
     /**
-     * Bind preview + still capture to the given view.
+     * 绑定预览 + 滤镜 + 拍照 + 录像。
      *
-     * Re-binding is allowed and expected (lens switch, resume from background);
-     * the previous session is unbound first so the camera is never opened twice.
+     * 重绑定是允许且预期的（切换镜头、从后台恢复）；旧的会话先解绑，
+     * 保证相机不会被打开两次。
      */
     suspend fun bind(
         owner: LifecycleOwner,
-        previewView: PreviewView,
+        previewView: PreviewSurfaceView,
         lensFacing: Int = CameraSelector.LENS_FACING_BACK,
-    ) {
+        filter: LiveFilter = LiveFilter.NONE,
+        intensity: Float = 1f,
+        grade: ColorGrade = ColorGrade.NONE,
+    ): CapabilitySnapshot {
         val cameraProvider = awaitProvider()
         provider = cameraProvider
 
-        val selector = CameraSelector.Builder()
-            .requireLensFacing(lensFacing)
-            .build()
+        // 选镜头。这里不能只按 facing 选 —— 一台手机同朝向往往有多个逻辑相机：
+        // 主摄（1.0–10.0）、超广角（0.6–10.0），甚至人像/长焦。CameraX 的
+        // `requireLensFacing` 只会挑"第一个符合的"，实测在这台 vivo 上挑中的是
+        // 1.0× 的主摄，于是变焦下限永远是 1.0，用户要的 0–1 区间根本没有。
+        //
+        // 所以：同朝向里优先挑 zoomRatio 下限最小的那颗 —— 下限 0.6 的那颗
+        // 就是带超广角的逻辑相机，它天然覆盖 0.6×–10×。
+        val selector = pickSelector(lensFacing)
+        Log.i(TAG, "selector: facing=$lensFacing (prefers ultra-wide when present)")
 
-        val previewUseCase = Preview.Builder().build().also {
-            // The surface provider must be attached to *this* preview instance;
-            // reusing an old provider after a rebind is the classic black-screen
-            // bug.
-            it.setSurfaceProvider(previewView.surfaceProvider)
+        val displayRotation = runCatching {
+            previewView.display?.rotation ?: android.view.Surface.ROTATION_0
+        }.getOrDefault(android.view.Surface.ROTATION_0)
+        Log.i(TAG, "display rotation=$displayRotation")
+
+        // 处理器先建好：预览的 SurfaceProvider 要用它，取景器的 Surface 也要挂上去。
+        val processor = GlFilterProcessor().apply {
+            this.filter = filter
+            this.intensity = intensity
+            this.grade = grade
+            // 前置是镜像的：不翻转的话，用户举右手画面里也举右手，
+            // 自拍时会觉得别扭。只翻预览和录像，不翻测量原图。
+            this.mirror = lensFacing == CameraSelector.LENS_FACING_FRONT
         }
+        filterProcessor = processor
+        previewSurfaceView = previewView
+
+        // 取景器 Surface 就绪/变化时通知处理器。
+        // PreviewSurfaceView 会记住当前表面并在注册时补发一次 —— 因为视图往往
+        // 先于相机绑定完成布局，surfaceCreated 早于这里执行。
+        previewView.onSurfaceAvailable = { surface, w, h ->
+            processor.attachPreviewSurface(surface, w, h)
+        }
+        previewView.onSurfaceSizeChanged = { w, h ->
+            processor.updatePreviewSize(w, h)
+        }
+        // 预览的相机帧交给处理器自己的 SurfaceTexture，由它处理后画到取景器。
+        // 不经过 PreviewView 的变换链 —— 那条链会和 SurfaceProcessor 打架。
+        val previewUseCase = Preview.Builder()
+            .setTargetRotation(displayRotation)
+            .build().also { preview ->
+                preview.setSurfaceProvider { request ->
+                    processor.providePreviewInput(request)
+                }
+            }
 
         val capture = ImageCapture.Builder()
-            // Minimise latency: a measurement is taken by pointing at a sample,
-            // and a 1.5 s lag makes the operator move the phone before the
-            // shutter actually fires.
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
             .setFlashMode(ImageCapture.FLASH_MODE_OFF)
+            .setTargetRotation(displayRotation)
+            .build()
+
+        // 录像：优先 FHD，不支持就退回 HD/SD。FallbackStrategy 让它自动降级，
+        // 而不是在低端设备上直接抛异常。
+        val recorder = Recorder.Builder()
+            .setQualitySelector(
+                QualitySelector.fromOrderedList(
+                    listOf(Quality.FHD, Quality.HD, Quality.SD),
+                    FallbackStrategy.lowerQualityOrHigherThan(Quality.SD),
+                ),
+            )
+            .build()
+        val video = VideoCapture.withOutput(recorder).apply {
+            targetRotation = displayRotation
+        }
+
+        // effect 只投给 VIDEO_CAPTURE：预览已经由处理器自己画了。
+        // 这样录像拿到的是同一套 GL 处理结果，所见即所录。
+        val effect = VideoFilterEffect(processor)
+
+        val group = UseCaseGroup.Builder()
+            .addUseCase(previewUseCase)
+            .addUseCase(capture)
+            .addUseCase(video)
+            .addEffect(effect)
             .build()
 
         cameraProvider.unbindAll()
-        // Keep the Camera object: the AE/AWB lock needs it for interop controls,
-        // and the use cases alone cannot express that.
-        camera = cameraProvider.bindToLifecycle(owner, selector, previewUseCase, capture)
+        camera = cameraProvider.bindToLifecycle(owner, selector, group)
 
         preview = previewUseCase
         imageCapture = capture
+        videoCapture = video
+
+        // 绑定完成、camera 已赋值，此时取能力才是真的。
+        return capabilitySnapshot()
+    }
+
+    /**
+     * 更新实时滤镜。
+     *
+     * 只写渲染器的两个 volatile 字段，不重建管线 —— 所以切换滤镜是即时的，
+     * 而且录像中途切换也不会中断录制。
+     */
+    fun setLiveFilter(filter: LiveFilter, intensity: Float = 1f) {
+        filterProcessor?.let {
+            it.filter = filter
+            it.intensity = intensity.coerceIn(0f, 1f)
+        }
     }
 
     fun setFlashMode(mode: Int) {
         imageCapture?.flashMode = mode
     }
 
+    // ------------------------------------------------------------ 参数控制
+
+    /** 变焦倍率。范围由设备的 [zoomRange] 决定，**可能是 0.6 而不是 1.0**。 */
+    suspend fun setZoomRatio(ratio: Float) {
+        val c = camera ?: return
+        val (lo, hi) = zoomRange()
+        runCatching { c.cameraControl.setZoomRatio(ratio.coerceIn(lo, hi)) }
+            .onFailure { Log.w(TAG, "setZoomRatio($ratio) failed", it) }
+    }
+
+    /** 当前变焦范围，供 UI 设置滑块上界。 */
+    fun zoomRange(): Pair<Float, Float> {
+        val state = camera?.cameraInfo?.zoomState?.value
+        if (state == null) {
+            Log.w(TAG, "zoomRange: no camera or zoomState yet")
+            return 1f to 1f
+        }
+        Log.i(
+            TAG,
+            "zoomRange: min=${state.minZoomRatio} max=${state.maxZoomRatio} " +
+                "current=${state.zoomRatio} linear=${state.linearZoom}",
+        )
+        return state.minZoomRatio to state.maxZoomRatio
+    }
+
     /**
-     * Lock or unlock auto-exposure and auto-white-balance.
+     * 相机绑定完成后调用，把设备能力一次性报给 UI。
      *
-     * This is the single most important control for repeatability.  With AE/AWB
-     * free-running, taking a white reference and then measuring a darker sample
-     * changes the exposure and the channel gains between the two shots - so the
-     * division silently compares two different cameras.  Locking them makes the
-     * reference and the samples share one physical state.
+     * 为什么不让 UI 直接调 [zoomRange] / [exposureRange]：那两个方法读的是
+     * controller 内部的 `camera` 字段，而它不是 Compose 状态。UI 用
+     * `remember(controller, bound)` 缓存结果时，bound 变 true 那一刻 camera
+     * 可能还没赋值（绑定是协程，赋值在其末尾），于是拿到 null 就永久缓存了
+     * 空范围 —— 实测表现为"变焦显示 1.0×、滑块拖不动"。
      *
-     * CameraX exposes no direct API for this, so it goes through Camera2Interop,
-     * which is why it needs the Camera2-backed camera object rather than the
-     * use case alone.
+     * 现在改成绑定完成后主动取一次，UI 只是被动接收，不存在时序竞态。
+     */
+    fun capabilitySnapshot(): CapabilitySnapshot {
+        val zoom = zoomRange()
+        val exp = exposureRange()
+        val step = exposureStepEv()
+        Log.i(
+            TAG,
+            "capabilities: zoom=${zoom.first}..${zoom.second} exposure=$exp step=$step",
+        )
+        return CapabilitySnapshot(
+            zoomMin = zoom.first,
+            zoomMax = zoom.second,
+            exposureRange = exp,
+            hasUltraWide = zoom.first < 0.999f,
+            exposureStepEv = step,
+            ultraWideBlocked = ultraWideUnavailable,
+        )
+    }
+
+    /**
+     * 设备每档曝光补偿的 EV 数。
+     *
+     * CameraX 的 `exposureState` 只给整数索引范围，不给每档多少 EV ——
+     * 而各机型并不统一：常见 1/3 EV，也有 1/2、1/4，这台实测 1/6。
+     * 从 Camera2 特性里直接读 `CONTROL_AE_COMPENSATION_STEP`，读不到才退回 1/3。
+     *
+     * 之前界面写死 `index / 3.0`，在 1/6 步长的机器上读数会差一倍 ——
+     * 显示 "+1.3 EV" 实际只补偿了 0.7 EV。
+     */
+    fun exposureStepEv(): Double {
+        val info = camera?.cameraInfo ?: return 1.0 / 3.0
+        val step: android.util.Rational = runCatching {
+            androidx.camera.camera2.interop.Camera2CameraInfo.from(info)
+                .getCameraCharacteristic(
+                    android.hardware.camera2.CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP,
+                )
+        }.getOrNull() ?: return 1.0 / 3.0
+        val v = step.toDouble()
+        return if (v > 0.0 && v < 10.0) v else 1.0 / 3.0
+    }
+
+    /** 手动调色。只写渲染器字段，不重建管线，所以拖滑杆是实时的。 */
+    fun setColorGrade(grade: ColorGrade) {
+        filterProcessor?.grade = grade
+    }
+
+    /**
+     * 曝光补偿。单位是"档"，每档通常是 1/3 EV，具体由设备决定。
+     *
+     * 这是唯一一个既影响观感、又影响测量读数的参数 —— 所以它被明确标注，
+     * 并且改变它会清空标定（和切 GC 同理：参考白是在另一个曝光下测的）。
+     */
+    suspend fun setExposureCompensation(index: Int): Boolean {
+        val c = camera ?: return false
+        val info = c.cameraInfo.exposureState
+        if (!info.isExposureCompensationSupported) return false
+        val clamped = index.coerceIn(
+            info.exposureCompensationRange.lower,
+            info.exposureCompensationRange.upper,
+        )
+        return runCatching { c.cameraControl.setExposureCompensationIndex(clamped).get() }
+            .isSuccess
+    }
+
+    fun exposureRange(): IntRange {
+        val info = camera?.cameraInfo?.exposureState ?: return 0..0
+        if (!info.isExposureCompensationSupported) return 0..0
+        return info.exposureCompensationRange.lower..info.exposureCompensationRange.upper
+    }
+
+    /** 点按对焦 / 测光。x,y 是 view 内归一化坐标（0..1）。 */
+    suspend fun focusAt(previewView: PreviewView, x: Float, y: Float): Boolean {
+        val c = camera ?: return false
+        val factory = previewView.meteringPointFactory
+        val point = factory.createPoint(x, y)
+        val action = FocusMeteringAction.Builder(
+            point,
+            FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE or FocusMeteringAction.FLAG_AWB,
+        ).setAutoCancelDuration(3, java.util.concurrent.TimeUnit.SECONDS).build()
+        return runCatching { c.cameraControl.startFocusAndMetering(action).get().isFocusSuccessful }
+            .getOrDefault(false)
+    }
+
+    /**
+     * 锁定或解锁自动曝光与自动白平衡。
+     *
+     * 这是重复性最关键的一步。AE/AWB 自由运行时，先拍白参考再拍暗样品，
+     * 两次之间曝光和通道增益都会变 —— 那个除法就在悄悄比较两台不同的相机。
+     * 锁定之后参考和样品共享同一个物理状态。
+     *
+     * CameraX 没有直接 API，所以走 Camera2Interop。
      */
     suspend fun setAutoLock(locked: Boolean): Boolean {
         val camera = camera ?: return false
         return try {
             val ext = Camera2CameraControl.from(camera.cameraControl)
             val builder = CaptureRequestOptions.Builder()
-            // `CONTROL_AE_LOCK` / `CONTROL_AWB_LOCK` are typed `Key<Boolean>` in
-            // this SDK, so the value is a Boolean rather than the camera2
-            // metadata integer.
             builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, locked)
             builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, locked)
 
-            // `setCaptureRequestOptions` returns a ListenableFuture.  Ignoring it
-            // means an asynchronous failure is reported as success, and the caller
-            // then takes a white reference against an *unlocked* camera - the
-            // reference and every later sample are then taken under different
-            // exposures, and the division silently produces wrong colour.  Wait
-            // for the future and let its exception propagate.
+            // setCaptureRequestOptions 返回 ListenableFuture。忽略它等于把异步失败
+            // 当成成功，调用方随后会对着一个**没锁**的相机拍白参考。
             val future = ext.setCaptureRequestOptions(builder.build())
             kotlinx.coroutines.suspendCancellableCoroutine<Unit> { cont ->
                 future.addListener(
@@ -144,156 +351,228 @@ class CameraController(private val context: Context) {
                     mainExecutor,
                 )
             }
-            android.util.Log.d(TAG, "AE/AWB lock set to $locked")
+            Log.d(TAG, "AE/AWB lock set to $locked")
             true
         } catch (e: Exception) {
-            android.util.Log.w(TAG, "cannot set AE/AWB lock to $locked", e)
+            Log.w(TAG, "cannot set AE/AWB lock to $locked", e)
             false
         }
     }
 
     /**
-     * Bind preview + still capture, with the preview drawn through a custom renderer.
+     * 手动 ISO / 快门。仅在设备支持时生效。
      *
-     * This is the path that makes real-time filters possible. CameraX's
-     * `PreviewView` blits the camera surface straight to the screen and offers no
-     * hook to touch pixels, so a filtered viewfinder needs the preview to render
-     * into a `SurfaceTexture` we own, which an OpenGL thread then samples and
-     * draws with a fragment shader.
-     *
-     * Both shipping apps analysed for this feature do exactly this (InstaShot via
-     * GPUImage, Google Photos via its own GL pipeline): one texture fetch per
-     * pixel, all colour maths on the GPU.
+     * 用 Camera2Interop 直接下发 SENSOR_SENSITIVITY 与 SENSOR_EXPOSURE_TIME。
+     * 传 null 表示交回自动。
      */
-    suspend fun bindWithRenderer(
-        owner: LifecycleOwner,
-        renderer: LiveFilterRenderer,
-        lensFacing: Int = CameraSelector.LENS_FACING_BACK,
-    ) {
-        val cameraProvider = awaitProvider()
-        provider = cameraProvider
-
-        val selector = CameraSelector.Builder()
-            .requireLensFacing(lensFacing)
-            .build()
-
-        val previewUseCase = Preview.Builder().build().also { preview ->
-            preview.setSurfaceProvider { request ->
-                val st = renderer.surfaceTexture()
-                if (st == null) {
-                    Log.w(
-                        TAG,
-                        "surface provider called before the GL texture existed; " +
-                            "request resolution=${request.resolution}",
-                    )
-                    request.willNotProvideSurface()
-                    return@setSurfaceProvider
-                }
-
-                // `TransformationInfo` is NOT available synchronously here - it
-                // arrives through a listener, which is why the old code that read
-                // it directly did not compile. The buffer size is known now, so it
-                // is applied immediately and the rotation is patched in when the
-                // listener fires. Without that second step the crop is computed
-                // against an unrotated size and the preview tears.
-                renderer.setCameraFrame(
-                    resolution = request.resolution,
-                    rotationDegrees = 0,
-                    cropRect = request.resolution.let { android.graphics.Rect(0, 0, it.width, it.height) },
+    suspend fun setManualExposure(iso: Int?, exposureNs: Long?): Boolean {
+        val camera = camera ?: return false
+        return try {
+            val ext = Camera2CameraControl.from(camera.cameraControl)
+            val builder = CaptureRequestOptions.Builder()
+            if (iso != null) {
+                builder.setCaptureRequestOption(
+                    CaptureRequest.SENSOR_SENSITIVITY, iso,
                 )
-
-                request.setTransformationInfoListener(mainExecutor) { info ->
-                    renderer.setCameraFrame(
-                        resolution = request.resolution,
-                        rotationDegrees = info.rotationDegrees,
-                        cropRect = info.cropRect,
-                    )
-                }
-
-                Log.d(TAG, "providing surface ${request.resolution}")
-                request.provideSurface(
-                    android.view.Surface(st),
-                    mainExecutor,
-                ) { /* surface released by CameraX */ }
+                builder.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF,
+                )
+            } else {
+                builder.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON,
+                )
             }
+            if (exposureNs != null) {
+                builder.setCaptureRequestOption(
+                    CaptureRequest.SENSOR_EXPOSURE_TIME, exposureNs,
+                )
+            }
+            val future = ext.setCaptureRequestOptions(builder.build())
+            kotlinx.coroutines.suspendCancellableCoroutine<Unit> { cont ->
+                future.addListener(
+                    {
+                        try {
+                            future.get()
+                            if (cont.isActive) cont.resume(Unit)
+                        } catch (e: Exception) {
+                            if (cont.isActive) cont.resumeWithException(e)
+                        }
+                    },
+                    mainExecutor,
+                )
+            }
+            Log.d(TAG, "manual exposure iso=$iso exp=$exposureNs")
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "setManualExposure failed", e)
+            false
         }
-
-        val capture = ImageCapture.Builder()
-            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-            .setFlashMode(ImageCapture.FLASH_MODE_OFF)
-            .build()
-
-        cameraProvider.unbindAll()
-        camera = cameraProvider.bindToLifecycle(owner, selector, previewUseCase, capture)
-        preview = previewUseCase
-        imageCapture = capture
     }
 
-    /** Current camera object, used for interop controls. */
+    /** 设备支持的 ISO 范围；不支持手动时返回 null。 */
+    fun isoRange(): IntRange? {
+        val info = camera?.cameraInfo ?: return null
+        val range: Range<Int> = runCatching {
+            androidx.camera.camera2.interop.Camera2CameraInfo.from(info)
+                .getCameraCharacteristic(
+                    android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE,
+                )
+        }.getOrNull() ?: return null
+        return range.lower..range.upper
+    }
+
+    /** 设备支持的快门范围（纳秒）；不支持时返回 null。 */
+    fun exposureTimeRange(): LongRange? {
+        val info = camera?.cameraInfo ?: return null
+        val range: Range<Long> = runCatching {
+            androidx.camera.camera2.interop.Camera2CameraInfo.from(info)
+                .getCameraCharacteristic(
+                    android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE,
+                )
+        }.getOrNull() ?: return null
+        return range.lower..range.upper
+    }
+
+    // ------------------------------------------------------------ 录像
+
+    /**
+     * 开始录像。
+     *
+     * 音频在没授权时静默降级为无声录制，而不是让整个录像失败 ——
+     * 用户想要的是视频，声音是加分项。
+     */
+    fun startRecording(
+        withAudio: Boolean,
+        onEvent: (VideoRecordEvent) -> Unit,
+    ): Boolean {
+        val video = videoCapture ?: return false
+        if (isRecording) return false
+
+        val hasAudio = withAudio && ContextCompat.checkSelfPermission(
+            context, Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
+
+        val name = "LightYear_" + java.text.SimpleDateFormat(
+            "yyyyMMdd_HHmmss", java.util.Locale.US,
+        ).format(java.util.Date())
+
+        val pending = video.output.prepareRecording(
+            context,
+            MediaStoreOutput.mediaStore(context.contentResolver, name),
+        )
+        val prepared = if (hasAudio) pending.withAudioEnabled() else pending
+
+        activeRecording = prepared.start(mainExecutor) { event ->
+            if (event is VideoRecordEvent.Finalize) {
+                isRecording = false
+                activeRecording = null
+            }
+            onEvent(event)
+        }
+        isRecording = true
+        Log.i(TAG, "recording started audio=$hasAudio")
+        return true
+    }
+
+    fun stopRecording() {
+        activeRecording?.let {
+            runCatching { it.stop() }
+            activeRecording = null
+            isRecording = false
+        }
+    }
+
+    fun toggleRecording(
+        withAudio: Boolean,
+        onEvent: (VideoRecordEvent) -> Unit,
+    ): Boolean {
+        return if (isRecording) {
+            stopRecording()
+            true
+        } else {
+            startRecording(withAudio, onEvent)
+        }
+    }
+
+    // ------------------------------------------------------------ 拍照
+
+    /**
+     * 等 [PreviewView] 完成一次布局。
+     *
+     * `getViewPort()` 在视图测量完成前返回 null，而 null 的 ViewPort 会让
+     * CameraX 按传感器默认宽高比出图 —— 表现就是预览上下有黑边。
+     * 这里等到视图有非零尺寸为止，最多等 [timeoutMs]。
+     */
+    private suspend fun awaitLaidOut(view: android.view.View, timeoutMs: Long = 2000) {
+        if (view.width > 0 && view.height > 0) return
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (view.width > 0 && view.height > 0) return
+            kotlinx.coroutines.delay(16)
+        }
+        Log.w(TAG, "PreviewView still not laid out after ${timeoutMs}ms")
+    }
+
+    /** 当前相机对象，用于 interop 控制。 */
     var camera: androidx.camera.core.Camera? = null
         private set
 
-    /**
-     * The most recent captured still, as a bitmap.
-     *
-     * Kept so the UI can re-render it through a different filter without taking
-     * another picture.  That is what makes the filter bar feel live: switching
-     * filters after a shot re-processes this frame instead of asking the operator
-     * to hold still and shoot again.
-     */
+    /** 最近一张拍到的帧，供滤镜切换后重渲染。 */
     var lastShot: android.graphics.Bitmap? = null
         private set
 
     /**
-     * Apply a filter to the last captured frame and return a new bitmap.
+     * 对最近一张照片套用滤镜，返回新 bitmap。
      *
-     * Filters run here rather than in the preview stream.  A live filtered
-     * viewfinder would need a `SurfaceProcessor` and a GL pipeline; processing
-     * the still instead gives the same visual result for the thing that matters
-     * (examining a sample you have already framed) at a fraction of the
-     * complexity and with no risk of the preview and the measurement diverging.
-     *
-     * Returns `null` when there is nothing to filter.  The caller must then leave
-     * the live preview visible: covering a live viewfinder with a filter applied
-     * to a *stale or absent* frame hides the scene the operator is trying to
-     * frame, which is worse than showing no filter at all.
+     * 实时滤镜已经由 GPU 管线负责取景器，这个 CPU 版本保留是因为：
+     * 报告缩略图、离线复算、以及 GL 上下文不可用时的兜底，都需要一个
+     * 可在 JVM 上单测的等价实现。
      */
-    fun renderFiltered(kind: FilterKind): android.graphics.Bitmap? {
+    fun renderFiltered(kind: LiveFilter): android.graphics.Bitmap? {
         val source = lastShot ?: return null
-        if (kind == FilterKind.NONE || kind == FilterKind.GRID) return null
+        if (kind == LiveFilter.NONE) return null
         val w = source.width
         val h = source.height
         val pixels = IntArray(w * h)
         source.getPixels(pixels, 0, w, 0, 0, w, h)
-        Filters.apply(kind, pixels, w, h)
-        val out = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
-        out.setPixels(pixels, 0, w, 0, 0, w, h)
-        return out
+        for (i in pixels.indices) {
+            val p = pixels[i]
+            val r = ((p shr 16) and 0xFF) / 255.0
+            val g = ((p shr 8) and 0xFF) / 255.0
+            val b = (p and 0xFF) / 255.0
+            val lin = doubleArrayOf(
+                Colorimetry.srgbToLinear(r),
+                Colorimetry.srgbToLinear(g),
+                Colorimetry.srgbToLinear(b),
+            )
+            val out = LiveFilters.apply(kind, lin)
+            val rr = (Colorimetry.srgbEncode(out[0]) * 255).toInt().coerceIn(0, 255)
+            val gg = (Colorimetry.srgbEncode(out[1]) * 255).toInt().coerceIn(0, 255)
+            val bb = (Colorimetry.srgbEncode(out[2]) * 255).toInt().coerceIn(0, 255)
+            pixels[i] = (0xFF shl 24) or (rr shl 16) or (gg shl 8) or bb
+        }
+        val outBmp = android.graphics.Bitmap.createBitmap(
+            w, h, android.graphics.Bitmap.Config.ARGB_8888,
+        )
+        outBmp.setPixels(pixels, 0, w, 0, 0, w, h)
+        return outBmp
     }
 
     /**
-     * Take one still and decode it.
+     * 拍一张并存成图库照片，同时解码用于测量。
      *
-     * Returns `null` when a capture is already running, so a double tap is
-     * ignored rather than queued.
-     */
-    /**
-     * Take one still and decode it.
-     *
-     * Returns `null` when a capture is already running, so a double tap is
-     * ignored rather than queued.  Decoding runs on [Dispatchers.Default]: a
-     * 12 MP JPEG takes hundreds of milliseconds to decode, and doing that on the
-     * main thread freezes the preview for the whole time.
+     * 测量读的是 **ImageCapture 的原始输出**，不是滤镜后的画面 —— 这是硬边界：
+     * 滤镜是观察辅助，不能进数字。滤镜管线只写屏幕和视频。
      */
     suspend fun capture(gammaCorrected: Boolean): Capture? {
         val capture = imageCapture ?: throw IllegalStateException("相机未就绪")
         if (capturing) return null
         capturing = true
         try {
-            android.util.Log.d(TAG, "takePicture requested")
+            Log.d(TAG, "takePicture requested")
             val proxy = takePicture(capture)
             try {
-                android.util.Log.d(TAG, "decoding ${proxy.width}x${proxy.height}")
+                Log.d(TAG, "decoding ${proxy.width}x${proxy.height}")
                 val decoded = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
                     val bitmap = FrameDecoder.imageProxyToBitmap(proxy)
                     val mean = FrameDecoder.sampleCentrePatch(
@@ -301,18 +580,14 @@ class CameraController(private val context: Context) {
                         FrameDecoder.PATCH_FRACTION,
                         gammaCorrected,
                     )
-                    // No full-frame linear conversion: the measurement only needs
-                    // the patch mean, and converting 3 M pixels costs ~100 ms and
-                    // 70 MB for data nothing reads.
                     Triple(bitmap, mean, DoubleArray(0))
                 }
                 val (bitmap, mean, _) = decoded
-                // Remember the frame so the filter bar can re-render it without
-                // asking the operator to shoot again.
                 lastShot = bitmap
-                android.util.Log.d(
+                Log.d(
                     TAG,
-                    "decoded ${bitmap.width}x${bitmap.height} mean=${mean.joinToString { "%.4f".format(it) }}",
+                    "decoded ${bitmap.width}x${bitmap.height} " +
+                        "mean=${mean.joinToString { "%.4f".format(it) }}",
                 )
                 return Capture(
                     linearRgb = DoubleArray(0),
@@ -328,7 +603,55 @@ class CameraController(private val context: Context) {
             }
         } finally {
             capturing = false
-            android.util.Log.d(TAG, "capture finished")
+            Log.d(TAG, "capture finished")
+        }
+    }
+
+    /** 拍一张直接存到图库（不走测量）。 */
+    suspend fun captureToGallery(): Boolean {
+        val capture = imageCapture ?: return false
+        val resolver = context.contentResolver
+        val name = "LightYear_" + java.text.SimpleDateFormat(
+            "yyyyMMdd_HHmmss", java.util.Locale.US,
+        ).format(java.util.Date())
+
+        // 我们自己 insert 一行并拿到 OutputStream，让 CameraX 往里写字节。
+        //
+        // 不要用 OutputFileOptions.Builder(resolver, uri, values)：CameraX 内部
+        // 还会再 insert 一次（JpegBytes2Disk.copyFileToMediaStore），撞上我们
+        // 已插的那一行就抛异常，照片存不下来。
+        val target = MediaStoreOutput.openPhotoStream(resolver, name) ?: run {
+            Log.e(TAG, "cannot open MediaStore photo target")
+            return false
+        }
+
+        return try {
+            kotlinx.coroutines.suspendCancellableCoroutine { cont ->
+                val options = ImageCapture.OutputFileOptions.Builder(target.stream).build()
+                capture.takePicture(
+                    options,
+                    mainExecutor,
+                    object : ImageCapture.OnImageSavedCallback {
+                        override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                            target.close()
+                            MediaStoreOutput.publishPhoto(resolver, target.uri)
+                            if (cont.isActive) cont.resume(true)
+                        }
+
+                        override fun onError(exception: ImageCaptureException) {
+                            Log.e(TAG, "save photo failed", exception)
+                            target.close()
+                            MediaStoreOutput.deletePhoto(resolver, target.uri)
+                            if (cont.isActive) cont.resume(false)
+                        }
+                    },
+                )
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "captureToGallery failed", e)
+            runCatching { target.close() }
+            MediaStoreOutput.deletePhoto(resolver, target.uri)
+            false
         }
     }
 
@@ -338,12 +661,12 @@ class CameraController(private val context: Context) {
                 mainExecutor,
                 object : ImageCapture.OnImageCapturedCallback() {
                     override fun onCaptureSuccess(image: ImageProxy) {
-                        android.util.Log.d(TAG, "onCaptureSuccess active=${cont.isActive}")
+                        Log.d(TAG, "onCaptureSuccess active=${cont.isActive}")
                         if (cont.isActive) cont.resume(image) else image.close()
                     }
 
                     override fun onError(exception: ImageCaptureException) {
-                        android.util.Log.e(TAG, "onError code=${exception.imageCaptureError}", exception)
+                        Log.e(TAG, "onError code=${exception.imageCaptureError}", exception)
                         if (cont.isActive) cont.resumeWithException(exception)
                     }
                 },
@@ -365,10 +688,249 @@ class CameraController(private val context: Context) {
             )
         }
 
+    /**
+     * 在同朝向的相机里挑一颗，优先支持超广角（zoom 下限 < 1）的那颗。
+     *
+     * ## 为什么需要这个
+     *
+     * `CameraSelector.Builder().requireLensFacing(BACK)` 返回的是**第一个**
+     * 后置相机。现代手机的后置通常是多个逻辑相机并列：
+     *
+     * * 主摄逻辑相机：zoomRatioRange = [1.0, 10.0]
+     * * 超广角逻辑相机：zoomRatioRange = [0.6, 10.0]
+     *
+     * 用户要"0–1 区间的变焦"，只有后者能给。实测这台 vivo 有 8 个 camera
+     * device，其中两颗后置的下限是 0.6 —— 不主动挑就永远拿不到。
+     *
+     * ## 为什么按 zoom 下限挑，而不是按物理镜头 ID 挑
+     *
+     * 物理镜头 ID 是厂商私有的，不同机型完全不一样；而 `zoomRatioRange`
+     * 是标准 Camera2 特性，且**语义直接对应需求**：下限 0.6 就代表这颗
+     * 逻辑相机能拍比"标准视野"更宽的画面。用能力挑比用 ID 挑稳健得多。
+     *
+     * 拿不到 zoomState 时退回按 facing 选，保证不因为探测失败而没相机可用。
+     */
+    /**
+     * 在同朝向的相机里挑一颗，优先支持超广角（zoom 下限 < 1）的那颗。
+     *
+     * ## 为什么需要这个
+     *
+     * `CameraSelector.Builder().requireLensFacing(BACK)` 返回的是**第一个**
+     * 后置相机。现代手机的后置通常是多个逻辑相机并列：
+     *
+     * * 主摄逻辑相机：zoomRatioRange = [1.0, 10.0]
+     * * 超广角逻辑相机：zoomRatioRange = [0.6, 10.0]
+     *
+     * 用户要"0–1 区间的变焦"，只有后者能给。实测这台 vivo 有 8 个 camera
+     * device，其中两颗后置的下限是 0.6 —— 不主动挑就永远拿不到。
+     *
+     * ## 两个关键实现细节
+     *
+     * 1. **不能只写 `requireLensFacing` 再加 filter**：`requireLensFacing`
+     *    会在 filter 之前就把候选集收窄到"第一个匹配朝向的相机"，
+     *    filter 里永远只看到 1 个，挑无可挑。所以朝向过滤必须自己写在
+     *    filter 里，`requireLensFacing` 只作为兜底保留。
+     * 2. **filter 里不能读 `info.zoomState.value`**：那时相机还没绑定，
+     *    CameraX 会抛 `UnsupportedOperationException`。改读 Camera2 的
+     *    静态特性 `CONTROL_ZOOM_RATIO_RANGE`，它不需要绑定就能查。
+     */
+    private fun pickSelector(lensFacing: Int): CameraSelector =
+        CameraSelector.Builder()
+            .addCameraFilter { infos ->
+                // 先试超广角：CameraX 的 infos 里可能根本没有它，
+                // 那就用 Camera2 枚举出来的 cameraId 去匹配。
+                val ultraId = findUltraWideCameraId(lensFacing)
+                if (ultraId != null) {
+                    val match = infos.firstOrNull { info ->
+                        runCatching {
+                            androidx.camera.camera2.interop.Camera2CameraInfo.from(info)
+                                .cameraId == ultraId
+                        }.getOrDefault(false)
+                    }
+                    if (match != null) {
+                        Log.i(TAG, "pickSelector: matched ultra-wide cameraId=$ultraId")
+                        return@addCameraFilter listOf(match)
+                    }
+                    // CameraX 确实没暴露这颗 —— 记下来，让 UI 说明原因，
+                    // 而不是静默退回 1.0 让用户以为功能没做。
+                    Log.w(
+                        TAG,
+                        "pickSelector: ultra-wide cameraId=$ultraId not exposed by CameraX " +
+                            "(available=${infos.size})",
+                    )
+                    ultraWideUnavailable = true
+                }
+
+                val same = infos.filter { info ->
+                    runCatching { info.lensFacing }.getOrNull() == lensFacing
+                }
+                if (same.isEmpty()) {
+                    Log.w(TAG, "pickSelector: no camera for facing=$lensFacing")
+                    return@addCameraFilter infos
+                }
+                val withZoom = same.mapNotNull { info ->
+                    zoomRangeOf(info)?.let { info to it }
+                }
+                Log.i(
+                    TAG,
+                    "pickSelector: ${infos.size} total, ${same.size} facing=$lensFacing, zoom=" +
+                        withZoom.joinToString { "${it.second.first}..${it.second.second}" },
+                )
+                if (withZoom.isEmpty()) return@addCameraFilter same
+
+                // 下限最小的那颗 = 视野最广的那颗。
+                val widest = withZoom.minByOrNull { it.second.first } ?: return@addCameraFilter same
+                Log.i(
+                    TAG,
+                    "pickSelector: picked ${widest.second.first}..${widest.second.second}",
+                )
+                if (widest.second.first >= 0.999f) same else listOf(widest.first)
+            }
+            .build()
+
+    /**
+     * 设备有超广角相机，但 CameraX 没有把它暴露出来。
+     *
+     * UI 用这个说明"为什么没有 0.6×"，而不是让用户对着一个 1.0 起的
+     * 滑杆猜是功能没做还是设备不支持。
+     */
+    @Volatile
+    var ultraWideUnavailable: Boolean = false
+        private set
+
+    /**
+     * 从 Camera2 静态特性读 zoom 范围，不需要绑定。
+     *
+     * `CONTROL_ZOOM_RATIO_RANGE` 是 Android 11 起的关键；老设备退回
+     * `SCALER_AVAILABLE_MAX_DIGITAL_ZOOM`（下限固定 1.0）。
+     */
+    private fun zoomRangeOf(info: androidx.camera.core.CameraInfo): Pair<Float, Float>? {
+        val c2 = runCatching {
+            androidx.camera.camera2.interop.Camera2CameraInfo.from(info)
+        }.getOrNull() ?: return null
+        val range: android.util.Range<Float>? = runCatching {
+            c2.getCameraCharacteristic(
+                android.hardware.camera2.CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE,
+            )
+        }.getOrNull()
+        if (range != null) return range.lower to range.upper
+        val maxZoom: Float? = runCatching {
+            c2.getCameraCharacteristic(
+                android.hardware.camera2.CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM,
+            )
+        }.getOrNull()
+        return if (maxZoom != null) 1f to maxZoom else null
+    }
+
+    /**
+     * 这台设备的**超广角逻辑相机**的 cameraId，没有则 null。
+     *
+     * ## 为什么需要绕开 CameraX 的枚举
+     *
+     * 实测这台 vivo（V2352A / Android 16）有 8 个 camera device，其中
+     * 一颗后置逻辑相机的 `zoomRatioRange` 是 **0.6–10.0**，其
+     * `logicalMultiCamera.physicalIds = [3, 0]`（超广角 + 主摄）。
+     *
+     * 但 `ProcessCameraProvider.getAvailableCameraInfos()` 只返回 **2** 个
+     * （主摄 + 前置），那颗 0.6 起的相机被 CameraX 内部去重掉了。
+     * 于是不管怎么在 `CameraSelector` 里挑，`zoomState.minZoomRatio`
+     * 永远是 1.0 —— 用户要的"0–1 区间变焦"在 CameraX 层根本拿不到。
+     *
+     * 所以这里直接用 `CameraManager` 枚举全部 cameraId，找出 zoom 下限
+     * 小于 1 的那颗，用 `Camera2CameraInfo.getCameraId()` 在
+     * `CameraFilter` 里精确匹配它。
+     *
+     * 找不到就返回 null，调用方保持原行为 —— 这条路径是增强，不是依赖。
+     */
+    private fun findUltraWideCameraId(lensFacing: Int): String? {
+        val manager = runCatching {
+            context.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+        }.getOrNull() ?: return null
+        val ids = runCatching { manager.cameraIdList }.getOrDefault(emptyArray())
+
+        var best: Pair<String, Float>? = null
+        for (id in ids) {
+            val chars = runCatching { manager.getCameraCharacteristics(id) }.getOrNull() ?: continue
+            val facing = chars.get(android.hardware.camera2.CameraCharacteristics.LENS_FACING)
+            val expected = if (lensFacing == CameraSelector.LENS_FACING_FRONT) {
+                android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT
+            } else {
+                android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK
+            }
+            if (facing != expected) continue
+
+            val range = chars.get(
+                android.hardware.camera2.CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE,
+            ) ?: continue
+            val min = range.lower
+            Log.i(TAG, "camera id=$id facing=$facing zoom=${range.lower}..${range.upper}")
+            if (min < 0.999f && (best == null || min < best!!.second)) {
+                best = id to min
+            }
+        }
+        Log.i(TAG, "findUltraWideCameraId: ${best?.first ?: "none"} (min=${best?.second})")
+        return best?.first
+    }
+
+    /**
+     * 设备能力快照：变焦范围与曝光补偿范围。
+     *
+     * 只有在 [bind] 返回之后取才有意义 —— 绑定是协程，`camera` 在其末尾才赋值。
+     */
+    data class CapabilitySnapshot(
+        val zoomMin: Float,
+        val zoomMax: Float,
+        val exposureRange: IntRange,
+        /** 本次绑定实际用的相机 ID，排查"为什么没有超广角"时用。 */
+        val cameraId: String? = null,
+        /** 这颗镜头是否支持 < 1.0 的变焦（超广角）。 */
+        val hasUltraWide: Boolean = false,
+        /** 每档曝光补偿的 EV 数（1/3 或 1/10，由设备决定）。 */
+        val exposureStepEv: Double = 1.0 / 3.0,
+        /** 设备有超广角相机，但 CameraX 没暴露它 —— UI 要说明原因。 */
+        val ultraWideBlocked: Boolean = false,
+    )
+
     fun release() {
+        stopRecording()
+        previewSurfaceView?.onSurfaceAvailable = null
+        previewSurfaceView?.onSurfaceSizeChanged = null
+        previewSurfaceView = null
+        filterProcessor?.release()
+        filterProcessor = null
         provider?.unbindAll()
         provider = null
         imageCapture = null
         preview = null
+        videoCapture = null
+        camera = null
     }
 }
+
+/**
+ * 把 [GlFilterProcessor] 包成只作用于录像的 CameraEffect。
+ *
+ * ## 为什么只投 VIDEO_CAPTURE
+ *
+ * 预览已经由处理器自己画（[GlFilterProcessor.providePreviewInput]），
+ * 走的是我们自己的 SurfaceTexture + SurfaceView，完全不经过 PreviewView 的
+ * 变换链。如果把 PREVIEW 也交给 effect，CameraX 会把预览再接管一次，
+ * 我们就没有 Surface 可画了。
+ *
+ * 只投录像时，effect 给处理器一个录像输出 Surface，处理器用同一套 shader
+ * 再画一遍 —— 所以录进视频的画面和取景器里看到的是同一个滤镜结果。
+ *
+ * ## 为什么不含 IMAGE_CAPTURE
+ *
+ * 这台机器的本职是测色。测量读的是 ImageCapture 的原始输出，滤镜绝不能进
+ * 数字 —— 照片本来就不该带滤镜。滤镜作用于"你看到的"和"你录下的"，
+ * 测量走未处理的原图。这条边界是硬的。
+ */
+private class VideoFilterEffect(processor: GlFilterProcessor) : CameraEffect(
+    CameraEffect.VIDEO_CAPTURE,
+    CameraEffect.OUTPUT_OPTION_ONE_FOR_ALL_TARGETS,
+    CameraEffect.TRANSFORMATION_ARBITRARY,
+    Executor { it.run() },
+    processor as SurfaceProcessor,
+    { t -> Log.e("VideoFilterEffect", "effect error", t) },
+)

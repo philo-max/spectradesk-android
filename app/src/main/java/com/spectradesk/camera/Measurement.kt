@@ -48,6 +48,18 @@ data class CameraSettings(
     val torchOn: Boolean = false,
     val lensFacing: Int = androidx.camera.core.CameraSelector.LENS_FACING_BACK,
     val targetTolerance: Double = 2.0,
+    /** 实时滤镜强度，0 = 原图，1 = 全量。 */
+    val filterIntensity: Float = 1f,
+    /** 变焦倍率。 */
+    val zoomRatio: Float = 1f,
+    /** 曝光补偿档位索引。0 = 自动不加补偿。 */
+    val exposureIndex: Int = 0,
+    /** 录像是否录音。 */
+    val audioEnabled: Boolean = true,
+    /** 手动调色。全零 = 不调色，与之前行为一致。 */
+    val grade: ColorGrade = ColorGrade.NONE,
+    /** 界面用的调色预设名，null = 手动调过、不对应任何预设。 */
+    val gradePreset: String? = "原片",
 ) {
     fun gammaLabel(): String =
         if (gammaCorrected) "GC 开 · sRGB→线性" else "GC 关 · 按线性处理"

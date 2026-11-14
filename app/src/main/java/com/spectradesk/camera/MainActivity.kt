@@ -37,6 +37,8 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -56,6 +58,9 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -153,28 +158,37 @@ class MainActivity : ComponentActivity() {
     private var controller: CameraController? = null
 
     private val permissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) recreate() else finish()
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
+            // 相机是硬需求；麦克风可选（没授权就录无声视频）。
+            if (granted[Manifest.permission.CAMERA] == true) {
+                recreate()
+            } else {
+                finish()
+            }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Draw behind the system bars, then pad the content by the insets.  The
-        // previous version did neither, so the header sat underneath the status
-        // bar: the title was clipped and the two status pills overlapped the
-        // clock and battery icons.  That is the "适应得有点怪" part - nothing was
-        // broken, but every element was half a centimetre from where it belonged.
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).apply {
             isAppearanceLightStatusBars = false
             isAppearanceLightNavigationBars = false
         }
 
+        val need = mutableListOf<String>()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             != PackageManager.PERMISSION_GRANTED
         ) {
-            permissionLauncher.launch(Manifest.permission.CAMERA)
+            need += Manifest.permission.CAMERA
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            need += Manifest.permission.RECORD_AUDIO
+        }
+        if (need.isNotEmpty()) {
+            permissionLauncher.launch(need.toTypedArray())
         }
 
         controller = CameraController(this)
@@ -199,120 +213,78 @@ fun CameraScreen(controller: CameraController?) {
     val state by vm.state.collectAsState()
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
-    var previewView by remember { mutableStateOf<PreviewView?>(null) }
-    var glView by remember { mutableStateOf<android.opengl.GLSurfaceView?>(null) }
-    var renderer by remember { mutableStateOf<LiveFilterRenderer?>(null) }
-    // Flipped to true from the GL thread once the renderer has its SurfaceTexture.
-    // The camera bind waits on this, because binding first makes CameraX reject
-    // the surface and every filter silently disappears.
-    var glReady by remember { mutableStateOf(false) }
+    var previewView by remember { mutableStateOf<PreviewSurfaceView?>(null) }
     var bound by remember { mutableStateOf(false) }
+    // 设备能力（变焦范围、曝光范围）。绑定完成后由 bind() 的返回值填充。
+    // 用状态而不是 remember 缓存：camera 字段不是 Compose 状态，缓存会拿到空值。
+    var caps by remember { mutableStateOf<CameraController.CapabilitySnapshot?>(null) }
+    val context = androidx.compose.ui.platform.LocalContext.current
 
-    // Camera binding must NOT run inside a LaunchedEffect. Its coroutine scope is
-    // cancelled the moment the composable leaves the composition - which happens
-    // on any recomposition that changes a key, including the `glReady` flip this
-    // very bind waits for. The result is the "coroutine scope left the composition"
-    // error and a silent fallback to the unfiltered preview.
-    //
-    // A scope tied to the Activity survives recomposition, so the bind completes
-    // even while the UI is rebuilding. This is the same fix the earlier
-    // LaunchedEffect bind needed.
-    val activityScope = rememberCoroutineScope()
-
-    // Two bind paths: the GL renderer (needed for live filters) and the plain
-    // PreviewView (fallback if GL fails). A measuring tool must still let the
-    // operator take a reading when the GPU path is unavailable, so failing to
-    // create a GL context degrades to an unfiltered preview instead of a black
-    // screen.
-    //
-    // `glReady` is the key detail: the renderer's SurfaceTexture is created on the
-    // GL thread inside onSurfaceCreated, which runs *after* the factory returns.
-    // Binding before it exists makes CameraX refuse the surface, so the bind is
-    // deferred until the renderer reports that its GL surface exists.
-    LaunchedEffect(controller, glReady, state.settings.lensFacing) {
+    // Camera binding must NOT run inside a LaunchedEffect keyed on things that
+    // change often. Its coroutine scope is cancelled the moment the composable
+    // leaves the composition, which surfaces as "coroutine scope left the
+    // composition" and a silent fallback to a black preview.
+    LaunchedEffect(controller, previewView, state.settings.lensFacing) {
         val c = controller ?: return@LaunchedEffect
-        if (!glReady) return@LaunchedEffect
-        val r = renderer ?: return@LaunchedEffect
-        activityScope.launch {
-            try {
-                c.bindWithRenderer(lifecycleOwner, r, state.settings.lensFacing)
-                bound = true
-            } catch (e: Throwable) {
-                // Log the actual cause: a silent fallback here means the operator
-                // sees "filters unavailable" with no way to diagnose why, and a
-                // filter that silently disappears looks like a measurement
-                // problem rather than a preview one.
-                android.util.Log.e(
-                    "SpectraDesk",
-                    "GL preview bind failed, falling back to PreviewView",
-                    e,
-                )
-                vm.message("实时滤镜不可用（${e.javaClass.simpleName}），已退回普通预览")
-                // Fall back to the plain preview so framing still works.
-                val view = previewView ?: return@launch
-                try {
-                    c.bind(lifecycleOwner, view, state.settings.lensFacing)
-                    bound = true
-                } catch (e2: Throwable) {
-                    android.util.Log.e("SpectraDesk", "camera bind failed", e2)
-                    vm.message("相机启动失败：${e2.javaClass.simpleName}: ${e2.message}")
-                }
-            }
+        val view = previewView ?: return@LaunchedEffect
+        try {
+            caps = c.bind(
+                lifecycleOwner,
+                view,
+                state.settings.lensFacing,
+                filter = if (state.liveFilterOn) state.filter else LiveFilter.NONE,
+                intensity = state.settings.filterIntensity,
+                grade = state.settings.grade,
+            )
+            bound = true
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            android.util.Log.e("SpectraDesk", "camera bind failed", e)
+            vm.message("相机启动失败：${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
-    // GLSurfaceView must be resumed and paused with the Activity, or its render
-    // thread stops and the preview goes black while the camera stays open. The
-    // AndroidView factory has no lifecycle hook of its own, so this is driven
-    // from the composable's own lifecycle observer.
-    val glLifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(glLifecycleOwner, glView) {
-        val view = glView
-        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            when (event) {
-                androidx.lifecycle.Lifecycle.Event.ON_RESUME -> view?.onResume()
-                androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> view?.onPause()
-                else -> Unit
-            }
-        }
-        glLifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            glLifecycleOwner.lifecycle.removeObserver(observer)
-            view?.onPause()
+    // 滤镜变化只写渲染器字段，不重建管线 —— 切换即时，录像中途切换也不中断。
+    LaunchedEffect(state.filter, state.settings.filterIntensity, state.liveFilterOn) {
+        val kind = if (state.liveFilterOn) state.filter else LiveFilter.NONE
+        controller?.setLiveFilter(kind, state.settings.filterIntensity)
+    }
+
+    // 变焦
+    LaunchedEffect(state.settings.zoomRatio, caps) {
+        controller?.setZoomRatio(state.settings.zoomRatio)
+    }
+
+    // 调色：只写渲染器字段，拖滑杆实时生效，不重建管线。
+    LaunchedEffect(state.settings.grade) {
+        controller?.setColorGrade(state.settings.grade)
+    }
+
+    // 曝光补偿
+    LaunchedEffect(state.settings.exposureIndex) {
+        controller?.setExposureCompensation(state.settings.exposureIndex)
+    }
+
+    // 录像计时
+    LaunchedEffect(state.recording) {
+        if (!state.recording) return@LaunchedEffect
+        var secs = 0
+        while (state.recording) {
+            kotlinx.coroutines.delay(1000)
+            secs++
+            vm.setRecordingSeconds(secs)
         }
     }
 
-    // Push the selected filter into the renderer.  The renderer reads these fields
-    // on the GL thread during onDrawFrame, so a plain volatile write is the right
-    // handoff: the frame that is one filter behind is imperceptible, and a lock
-    // would stall the GL thread.
-    LaunchedEffect(state.filter) {
-        renderer?.filter = state.filter
-    }
-
-    /** One shutter action: capture, then either calibrate or measure. */
-    fun shutter(mode: ShutterMode) {
+    /** 快门：拍照存图库。 */
+    fun takePhoto() {
         val c = controller ?: return
         scope.launch {
             vm.setBusy(true)
             try {
-                // Locking before the white reference is what makes every later
-                // reading comparable: with AE/AWB free-running, the reference and
-                // the sample are effectively taken by two different cameras.
-                if (mode == ShutterMode.WHITE) {
-                    val locked = c.setAutoLock(true)
-                    vm.setExposureLocked(locked)
-                }
-                val shot = c.capture(state.settings.gammaCorrected)
-                if (shot == null) {
-                    vm.message("正在拍摄，请稍候")
-                } else {
-                    when (mode) {
-                        ShutterMode.WHITE -> vm.takeWhiteReference(shot, state.exposureLocked)
-                        ShutterMode.DARK -> vm.takeDarkReference(shot)
-                        ShutterMode.MEASURE -> vm.measure(shot)
-                    }
-                }
+                val ok = c.captureToGallery()
+                vm.message(if (ok) "已保存到相册 · Pictures/LightYear" else "保存失败")
             } catch (e: Exception) {
                 vm.message("拍摄失败：${e.message}")
             } finally {
@@ -321,21 +293,43 @@ fun CameraScreen(controller: CameraController?) {
         }
     }
 
+    /** 录像开关。 */
+    fun toggleRecord() {
+        val c = controller ?: return
+        if (state.recording) {
+            c.stopRecording()
+            vm.setRecording(false)
+        } else {
+            val started = c.startRecording(state.settings.audioEnabled) { event ->
+                when (event) {
+                    is androidx.camera.video.VideoRecordEvent.Finalize -> {
+                        vm.setRecording(false)
+                        val err = event.error
+                        if (err != androidx.camera.video.VideoRecordEvent.Finalize.ERROR_NONE) {
+                            vm.message("录像结束（错误 $err）")
+                        } else {
+                            vm.message("视频已保存到相册 · Movies/LightYear")
+                        }
+                    }
+                    is androidx.camera.video.VideoRecordEvent.Start -> {
+                        vm.message("开始录像")
+                    }
+                    else -> Unit
+                }
+            }
+            vm.setRecording(started)
+            if (!started) vm.message("录像启动失败")
+        }
+    }
+
     val colors = MaterialTheme.colorScheme
 
-    // 版面主次：取景区占用全部剩余高度（weight 1f）成为最大块；
-    // 读数卡紧随其下作为视觉焦点；控制区压缩为紧凑的次要层；记录区最弱。
-    //
-    // 系统栏内边距：状态栏高度必须让给顶部，导航栏高度必须让给底部，
-    // 否则标题会被状态栏压住、快门会被手势条压住。这是上一版"看着别扭"
-    // 的根因——元素本身没错，只是位置整体偏了。
     Column(
         Modifier
             .fillMaxSize()
             .background(colors.background)
             .windowInsetsPadding(WindowInsets.safeDrawing)
     ) {
-        val context = androidx.compose.ui.platform.LocalContext.current
         Header(state)
 
         Box(
@@ -345,73 +339,101 @@ fun CameraScreen(controller: CameraController?) {
                 .padding(horizontal = 12.dp, vertical = 4.dp)
                 .clip(PanelShape)
                 .border(1.dp, colors.outlineVariant, PanelShape),
-        ) {
-            AndroidView(
+        ) {            AndroidView(
                 factory = { ctx ->
-                    // GLSurfaceView, not PreviewView: the camera renders into an
-                    // external OES texture that the fragment shader samples, which
-                    // is the only way to get true live filters. PreviewView blits
-                    // the camera surface directly and offers no pixel hook.
-                    android.opengl.GLSurfaceView(ctx).also { view ->
-                        val r = LiveFilterRenderer(
-                            context = ctx,
-                            onFrameAvailable = {
-                                view.requestRender()
-                            },
-                            // Runs on the GL thread; the surface now exists, so the
-                            // camera bind can proceed. Compose state written from a
-                            // non-main thread does trigger recomposition (snapshot
-                            // system handles it), which is what unblocks the bind.
-                            onSurfaceReady = { glReady = true },
-                        )
-                        view.setEGLContextClientVersion(2)
-                        view.setRenderer(r)
-                        // Continuous rendering rather than WHEN_DIRTY: with
-                        // WHEN_DIRTY the frame is only drawn when requestRender()
-                        // fires, and a missed call leaves a black preview with no
-                        // error anywhere. The battery cost of a full-screen
-                        // viewfinder is the same either way at 30 fps, so the
-                        // robust option is also the cheaper one.
-                        view.renderMode = android.opengl.GLSurfaceView.RENDERMODE_CONTINUOUSLY
-                        glView = view
-                        renderer = r
+                    PreviewSurfaceView(ctx).also {
+                        previewView = it
                     }
                 },
                 modifier = Modifier.fillMaxSize().background(colors.scrim),
             )
 
-            // When a filter is active, the captured frame is shown on top of the
-            // live preview so the operator can examine the sample through it.
-            // The live preview stays underneath and keeps running, so the moment
-            // the filter is switched off the viewfinder is current again.
+            // 测量准星：只有开测量模式才显示，否则普通拍照/录像时它是干扰。
+            if (state.paramsOpen) {
+                ReticleOverlay(fraction = state.settings.patchFraction)
+            }
 
-            // The reticle marks the exact area that is measured.  Without it the
-            // user has no idea which part of the frame the number came from.
-            ReticleOverlay(fraction = state.settings.patchFraction)
+            // 录像红点 + 计时
+            if (state.recording) {
+                Row(
+                    Modifier
+                        .align(Alignment.TopStart)
+                        .padding(10.dp)
+                        .background(colors.scrim.copy(alpha = 0.7f), ChipShape)
+                        .padding(horizontal = 10.dp, vertical = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(Modifier.size(9.dp).background(colors.error, CircleShape))
+                    Spacer(Modifier.width(7.dp))
+                    Text(
+                        "%02d:%02d".format(state.recordingSeconds / 60, state.recordingSeconds % 60),
+                        color = colors.onSurface,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontFamily = Mono,
+                    )
+                }
+            }
 
-            // Filter chip strip, overlaid on the viewfinder rather than placed in
-            // the control column: choosing a viewing aid is a framing decision and
-            // belongs next to the image, not next to the shutter.
+            // 滤镜作用中的提示
+            if (state.liveFilterOn && state.filter != LiveFilter.NONE) {
+                Box(
+                    Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(10.dp)
+                        .background(colors.primary.copy(alpha = 0.9f), ChipShape)
+                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                ) {
+                    Text(
+                        "实时 · ${state.filter.label}",
+                        color = colors.onPrimary,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
+
             FilterBar(
                 selected = state.filter,
+                liveOn = state.liveFilterOn,
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(bottom = 8.dp),
                 onSelect = { vm.setFilter(it) },
+                onToggleLive = { vm.setLiveFilterOn(!state.liveFilterOn) },
             )
 
-            // A filter that changes pixels is a viewing aid, not a measurement
-            // condition.  Saying so on screen prevents the classic mistake of
-            // trusting a number taken through a false-colour view.
-            if (!state.filter.measurementSafe) {
+            // 参数面板做成取景器内的浮层，而不是挤在下方。
+            //
+            // 这不是审美选择：SurfaceView 的缓冲区尺寸跟 View 尺寸绑定，
+            // 一旦参数面板把取景器压矮，缓冲区要重建，重建期间画面会缩在
+            // 中间露出黑边。浮层不改变取景器尺寸，就没有这个问题。
+            if (state.paramsOpen) {
                 Box(
                     Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(8.dp)
-                        .background(colors.errorContainer, ChipShape)
-                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .padding(bottom = 44.dp)
+                        .background(colors.surface.copy(alpha = 0.96f), RoundedCornerShape(10.dp))
+                        // 面板加了调色十项滑杆，高度会超过取景器 —— 必须能滚。
+                        // 用 verticalScroll 而不是 LazyColumn：项数固定且少，
+                        // LazyColumn 的复用在这里只会让滑杆状态更难保持。
+                        .heightIn(max = 520.dp)
+                        .verticalScroll(rememberScrollState()),
                 ) {
-                    Text("滤镜仅影响显示", color = colors.onErrorContainer, style = MaterialTheme.typography.labelSmall)
+                    ParamsPanel(
+                        state = state,
+                        controller = controller,
+                        caps = caps,
+                        onZoom = { vm.setZoom(it, (caps?.zoomMin ?: 1f)..(caps?.zoomMax ?: 1f)) },
+                        onExposure = { vm.setExposureIndex(it) },
+                        onIntensity = { vm.setFilterIntensity(it) },
+                        onAudio = { vm.setAudioEnabled(it) },
+                        onGamma = vm::setGammaCorrected,
+                        onClampExposure = { vm.clampExposureIndex(it) },
+                        onGradeChannel = { ch, v -> vm.setGradeChannel(ch, v) },
+                        onGradePreset = { vm.applyGradePreset(it) },
+                        onGradeReset = { vm.resetGrade() },
+                    )
                 }
             }
 
@@ -425,7 +447,7 @@ fun CameraScreen(controller: CameraController?) {
                 Box(
                     Modifier
                         .align(Alignment.TopCenter)
-                        .padding(8.dp)
+                        .padding(top = 44.dp)
                         .background(colors.surface.copy(alpha = 0.92f), RoundedCornerShape(8.dp))
                         .border(1.dp, colors.outline, RoundedCornerShape(8.dp))
                         .padding(horizontal = 12.dp, vertical = 6.dp),
@@ -433,77 +455,483 @@ fun CameraScreen(controller: CameraController?) {
                     Text(msg, color = colors.onSurface, style = MaterialTheme.typography.bodySmall)
                 }
             }
+
         }
 
-        Spacer(Modifier.height(8.dp))
-        Readout(state)
         Spacer(Modifier.height(6.dp))
 
-        Controls(
-            state = state,
-            onShutter = { shutter(ShutterMode.MEASURE) },
-            onWhite = { shutter(ShutterMode.WHITE) },
-            onDark = { shutter(ShutterMode.DARK) },
-            onGamma = vm::setGammaCorrected,
-            onStandard = vm::setStandard,
-            onClearCal = vm::clearCalibration,
-            onClearHistory = vm::clearHistory,
-            onExportCsv = {
-                if (state.measurements.isEmpty()) {
-                    vm.message("没有可导出的记录")
-                } else {
-                    val f = Exporter.writeCsv(context, state)
-                    Exporter.share(context, f, "text/csv")
-                }
-            },
-            onExportHtml = {
-                if (state.measurements.isEmpty()) {
-                    vm.message("没有可导出的记录")
-                } else {
-                    val f = Exporter.writeHtml(context, state)
-                    Exporter.share(context, f, "text/html")
-                }
-            },
-        )
+        // 主控制条：参数开关 | 快门 | 录像
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceEvenly,
+        ) {
+            // 参数面板开关
+            Box(
+                Modifier
+                    .size(52.dp)
+                    .clip(CircleShape)
+                    .background(if (state.paramsOpen) colors.primary else colors.surfaceVariant)
+                    .clickable { vm.setParamsOpen(!state.paramsOpen) },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "参数",
+                    color = if (state.paramsOpen) colors.onPrimary else colors.onSurface,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
 
-        if (state.measurements.isNotEmpty()) {
-            History(state.measurements)
+            // 前后置切换。放在快门左侧、参数右侧，和系统相机的布局一致。
+            val isFront = state.settings.lensFacing ==
+                androidx.camera.core.CameraSelector.LENS_FACING_FRONT
+            Box(
+                Modifier
+                    .size(52.dp)
+                    .clip(CircleShape)
+                    .background(if (isFront) colors.secondary else colors.surfaceVariant)
+                    .border(1.dp, if (isFront) colors.secondary else colors.outline, CircleShape)
+                    .clickable { vm.toggleLens() }
+                    .semantics {
+                        contentDescription = if (isFront) "切到后置" else "切到前置"
+                        role = Role.Button
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    if (isFront) "前置" else "后置",
+                    color = if (isFront) colors.onSecondary else colors.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+
+            // 快门
+            ShutterButton(
+                busy = state.busy,
+                recording = state.recording,
+                onClick = { if (state.recording) toggleRecord() else takePhoto() },
+            )
+
+            // 录像
+            Box(
+                Modifier
+                    .size(52.dp)
+                    .clip(CircleShape)
+                    .background(if (state.recording) colors.error else colors.surfaceVariant)
+                    .border(
+                        2.dp,
+                        if (state.recording) colors.error else colors.outline,
+                        CircleShape,
+                    )
+                    .clickable { toggleRecord() },
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(
+                    Modifier
+                        .size(if (state.recording) 18.dp else 24.dp)
+                        .clip(if (state.recording) RoundedCornerShape(3.dp) else CircleShape)
+                        .background(if (state.recording) colors.onError else colors.error),
+                )
+            }
         }
+
+        Text(
+            when {
+                state.recording -> "录像中 · 点快门停止"
+                state.busy -> "保存中…"
+                else -> "点快门拍照 · 右侧开始录像"
+            },
+            color = colors.onSurfaceVariant,
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 4.dp),
+            textAlign = TextAlign.Center,
+        )
     }
 }
 
 enum class ShutterMode { MEASURE, WHITE, DARK }
 
+/**
+ * 参数面板：变焦、曝光补偿、滤镜强度、录音、伽马。
+ *
+ * ## 哪些参数是"观感"、哪些会改测量
+ *
+ * 这个区分必须显式做出来，否则用户会以为所有滑块都只影响画面：
+ *
+ * | 参数 | 改观感 | 改测量读数 | 处理 |
+ * |---|---|---|---|
+ * | 变焦 | 是 | 否（只改取景范围） | 直接下发 |
+ * | 滤镜强度 | 是 | 否（测量读原始帧） | 只写渲染器 |
+ * | 录音 | 否 | 否 | 只影响视频 |
+ * | 曝光补偿 | 是 | **是** | 清空标定 |
+ * | GC 伽马 | 是 | **是** | 清空标定 |
+ *
+ * 后两个不是"设置"，是物理条件的改变：白参考是在旧条件下测的，
+ * 拿它去除新读数会得到一个看起来合理的错误颜色。
+ */
 @Composable
-private fun FilterBar(
-    selected: LiveFilter,
-    modifier: Modifier = Modifier,
-    onSelect: (LiveFilter) -> Unit,
+private fun ParamsPanel(
+    state: UiState,
+    controller: CameraController?,
+    /** 相机绑定完成时取到的设备能力；null 表示还没绑定好。 */
+    caps: CameraController.CapabilitySnapshot?,
+    onZoom: (Float) -> Unit,
+    onExposure: (Int) -> Unit,
+    onIntensity: (Float) -> Unit,
+    onAudio: (Boolean) -> Unit,
+    onGamma: (Boolean) -> Unit,
+    onClampExposure: (IntRange) -> Unit,
+    onGradeChannel: (ColorGrade.Channel, Float) -> Unit,
+    onGradePreset: (String) -> Unit,
+    onGradeReset: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
-    // 半透明底条压在取景画面上：选中项用琥珀主色，与快门、准星同属"操作色"。
-    LazyRow(
-        modifier = modifier
-            .background(colors.scrim.copy(alpha = OVERLAY_ALPHA), ChipShape)
-            .padding(horizontal = 4.dp, vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-        verticalAlignment = Alignment.CenterVertically,
+
+    // 设备能力直接来自 bind() 的返回值，不再自己读 controller。
+    //
+    // 之前用 remember(controller, bound) 缓存 zoomRange()/exposureRange()：
+    // 那两个方法读的是 controller 内部的 camera 字段，它不是 Compose 状态。
+    // bound 变 true 的那一刻 camera 可能还没赋值（绑定是协程，赋值在末尾），
+    // 于是空范围被永久缓存 —— 实测表现是"变焦显示 1.0×、拖不动"。
+    val zoomMax = caps?.zoomMax ?: 1f
+    val exposureRange = caps?.exposureRange ?: 0..0
+    /** 设备每档曝光补偿的 EV 数。默认 1/3，绑定后由真实范围推出。 */
+    val evStep = caps?.exposureStepEv ?: (1.0 / 3.0)
+
+    // 范围拿到后校正一次索引：绑定前滑块可能已经把索引推到设备不支持的档位。
+    LaunchedEffect(exposureRange) {
+        onClampExposure(exposureRange)
+    }
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp)
+            .clip(PanelShape)
+            .background(colors.surface)
+            .border(1.dp, colors.outlineVariant, PanelShape)
+            .padding(horizontal = 14.dp, vertical = 10.dp),
     ) {
-        items(LiveFilter.entries.toList()) { kind ->
-            val active = kind == selected
+        // 变焦。下界取设备的真实下限 —— 带超广角的机型是 0.6，不是 1.0。
+        //
+        // 之前这里写死 `1f..zoomMax`，于是 0.6–1.0 那段永远拖不到，
+        // 而这台 vivo 的超广角逻辑相机恰恰是 0.6 起。滑杆下界必须是设备
+        // 报的 zoomMin，否则用户要的"0–1 区间"根本不存在。
+        val zoomMin = caps?.zoomMin ?: 1f
+        ParamRow(
+            label = "变焦",
+            value = "%.1f×".format(state.settings.zoomRatio),
+        ) {
+            if (zoomMax > zoomMin + 0.001f) {
+                Slider(
+                    value = state.settings.zoomRatio.coerceIn(zoomMin, zoomMax),
+                    onValueChange = { onZoom(it) },
+                    valueRange = zoomMin..zoomMax,
+                    colors = sliderColors(colors),
+                    modifier = Modifier.fillMaxWidth().height(28.dp),
+                )
+                // 快捷档位：0.6/1/2/3/5/10 一键跳。滑杆在 0.6–10 上
+                // 一像素≈0.02×，精确跳到 1.0× 很难，这几个按钮解决它。
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 2.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    listOf(0.6f, 1f, 2f, 3f, 5f, 10f)
+                        .filter { it in zoomMin..zoomMax }
+                        .forEach { step ->
+                            val active = kotlin.math.abs(state.settings.zoomRatio - step) < 0.05f
+                            Box(
+                                Modifier
+                                    .weight(1f)
+                                    .clip(ChipShape)
+                                    .background(if (active) colors.primary else colors.surfaceVariant)
+                                    .clickable { onZoom(step) }
+                                    .padding(vertical = 5.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    if (step < 1f) "%.1f×".format(step) else "${step.toInt()}×",
+                                    color = if (active) colors.onPrimary else colors.onSurfaceVariant,
+                                    style = MonoSmall,
+                                )
+                            }
+                        }
+                }
+            } else {
+                // 把实际拿到的能力显示出来，而不是只说"不支持"。
+                // 排查时这一行比任何日志都有用：它直接说明 caps 是 null
+                // （还没绑定好）还是 max 真的是 1.0（设备真不支持）。
+                Text(
+                    if (caps == null) "设备能力尚未就绪（相机未绑定）"
+                    else "此设备不支持变焦（${caps.zoomMin}–${caps.zoomMax}）",
+                    color = colors.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+        }
+
+        // 曝光补偿。EV 步长不是常数 3 —— 设备每档可能是 1/3、1/2 甚至 1/4 EV。
+        // 之前写死 `/3.0`，在这台每档 1/6 EV 的机器上读数会差一倍。
+        ParamRow(
+            label = "曝光补偿",
+            value = "%+.1f EV".format(
+                state.settings.exposureIndex * evStep,
+            ),
+            warn = state.settings.exposureIndex != 0,
+        ) {
+            if (exposureRange.last > exposureRange.first) {
+                // 索引必须夹在真实范围内。范围在绑定前是 0..0，那时任何触摸都会
+                // 算出越界值；夹一次保证不会下发 -3.7 EV 这种设备根本不支持的档位。
+                val safeIndex = state.settings.exposureIndex
+                    .coerceIn(exposureRange.first, exposureRange.last)
+                Slider(
+                    value = safeIndex.toFloat(),
+                    onValueChange = { onExposure(it.toInt()) },
+                    valueRange = exposureRange.first.toFloat()..exposureRange.last.toFloat(),
+                    steps = ((exposureRange.last - exposureRange.first) - 1).coerceAtLeast(0),
+                    colors = sliderColors(colors),
+                    modifier = Modifier.fillMaxWidth().height(28.dp),
+                )
+            } else {
+                Text(
+                    "此设备不支持曝光补偿",
+                    color = colors.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+        }
+
+        // 滤镜强度
+        ParamRow(
+            label = "滤镜强度",
+            value = "%.0f%%".format(state.settings.filterIntensity * 100),
+        ) {
+            Slider(
+                value = state.settings.filterIntensity,
+                onValueChange = { onIntensity(it) },
+                valueRange = 0f..1f,
+                colors = sliderColors(colors),
+                modifier = Modifier.fillMaxWidth().height(28.dp),
+            )
+        }
+
+        HorizontalDivider(Modifier.padding(vertical = 6.dp), color = colors.outlineVariant)
+
+        // 开关行
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("录音", color = colors.onSurface, style = MaterialTheme.typography.labelMedium)
+            Spacer(Modifier.width(6.dp))
+            Switch(
+                checked = state.settings.audioEnabled,
+                onCheckedChange = onAudio,
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = colors.onPrimary,
+                    checkedTrackColor = colors.primary,
+                ),
+            )
+            Spacer(Modifier.weight(1f))
+            Text("GC 伽马", color = colors.onSurface, style = MaterialTheme.typography.labelMedium)
+            Spacer(Modifier.width(6.dp))
+            Switch(
+                checked = state.settings.gammaCorrected,
+                onCheckedChange = onGamma,
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = colors.onPrimary,
+                    checkedTrackColor = colors.primary,
+                    uncheckedThumbColor = colors.error,
+                    uncheckedTrackColor = colors.errorContainer,
+                    uncheckedBorderColor = colors.error,
+                ),
+            )
+        }
+
+        // 这两项会清标定，必须写在面板上而不是只写在代码注释里。
+        if (state.settings.exposureIndex != 0 || !state.settings.gammaCorrected) {
+            Text(
+                "曝光补偿 / GC 改变物理条件，已清除标定",
+                color = colors.error,
+                style = MonoSmall,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+
+        HorizontalDivider(Modifier.padding(vertical = 8.dp), color = colors.outlineVariant)
+
+        // ── 调色（参考剪映/醒图的「调节」分项）─────────────────────────
+        //
+        // 为什么和上面的参数分开：上面那些改的是**相机**（变焦、曝光、GC），
+        // 会改变物理条件甚至清掉标定；这里改的是**画面**，纯显示变换，
+        // 不进任何数字。分开标注，用户才不会以为调色会影响测色结果。
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("调色", color = colors.onSurface, style = MaterialTheme.typography.labelMedium)
+            Spacer(Modifier.width(8.dp))
+            Text(
+                if (state.settings.grade.isIdentity) "不影响测量" else "已调 ${state.settings.grade.activeCount} 项",
+                color = colors.tertiary,
+                style = MonoSmall,
+            )
+            Spacer(Modifier.weight(1f))
             Box(
                 Modifier
                     .clip(ChipShape)
-                    .background(if (active) colors.primary else Color.Transparent)
-                    .clickable { onSelect(kind) }
-                    .padding(horizontal = 12.dp, vertical = 5.dp),
+                    .background(colors.surfaceVariant)
+                    .clickable { onGradeReset() }
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
+            ) {
+                Text("还原", color = colors.onSurfaceVariant, style = MonoSmall)
+            }
+        }
+
+        // 预设：横排小胶囊，和上面的滤镜条区分开（这里是调色不是风格）。
+        LazyRow(
+            Modifier.fillMaxWidth().padding(top = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            items(ColorGrade.presets) { (name, _) ->
+                val active = state.settings.gradePreset == name
+                Box(
+                    Modifier
+                        .clip(ChipShape)
+                        .background(if (active) colors.tertiary else colors.surfaceVariant)
+                        .clickable { onGradePreset(name) }
+                        .padding(horizontal = 11.dp, vertical = 5.dp),
+                ) {
+                    Text(
+                        name,
+                        color = if (active) colors.onTertiary else colors.onSurfaceVariant,
+                        style = MonoSmall,
+                    )
+                }
+            }
+        }
+
+        // 十项滑杆。用循环生成，避免十段几乎一样的代码 —— 每项只在
+        // label/范围/get/set 上有差别，而这三个都已在 ColorGrade.Channel 里。
+        ColorGrade.Channel.entries.forEach { ch ->
+            val v = ch.get(state.settings.grade)
+            Row(
+                Modifier.fillMaxWidth().padding(top = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    kind.label,
-                    color = if (active) colors.onPrimary else colors.onSurfaceVariant,
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
+                    ch.label,
+                    color = colors.onSurfaceVariant,
+                    style = MonoSmall,
+                    modifier = Modifier.width(48.dp),
                 )
+                Slider(
+                    value = v,
+                    onValueChange = { onGradeChannel(ch, it) },
+                    valueRange = ch.min..ch.max,
+                    colors = SliderDefaults.colors(
+                        thumbColor = colors.tertiary,
+                        activeTrackColor = colors.tertiary,
+                        inactiveTrackColor = colors.outlineVariant,
+                    ),
+                    modifier = Modifier.weight(1f).height(26.dp),
+                )
+                Text(
+                    // 只有双向的项带正负号；锐化/暗角/颗粒是 0..1，加号没意义。
+                    if (ch.min < 0f) "%+.0f".format(v * 100) else "%.0f".format(v * 100),
+                    color = if (v != 0f) colors.tertiary else colors.onSurfaceVariant,
+                    style = MonoSmall,
+                    modifier = Modifier.width(38.dp),
+                    textAlign = TextAlign.End,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ParamRow(
+    label: String,
+    value: String,
+    warn: Boolean = false,
+    content: @Composable () -> Unit,
+) {
+    val colors = MaterialTheme.colorScheme
+    Column(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(label, color = colors.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
+            Spacer(Modifier.weight(1f))
+            Text(
+                value,
+                color = if (warn) colors.error else colors.onSurface,
+                style = MaterialTheme.typography.labelMedium,
+                fontFamily = Mono,
+            )
+        }
+        content()
+    }
+}
+
+@Composable
+private fun sliderColors(colors: androidx.compose.material3.ColorScheme) =
+    androidx.compose.material3.SliderDefaults.colors(
+        thumbColor = colors.primary,
+        activeTrackColor = colors.primary,
+        inactiveTrackColor = colors.outlineVariant,
+    )
+
+
+@Composable
+private fun FilterBar(
+    selected: LiveFilter,
+    liveOn: Boolean,
+    modifier: Modifier = Modifier,
+    onSelect: (LiveFilter) -> Unit,
+    onToggleLive: () -> Unit,
+) {
+    val colors = MaterialTheme.colorScheme
+    Row(
+        modifier = modifier
+            .background(colors.scrim.copy(alpha = OVERLAY_ALPHA), ChipShape)
+            .padding(horizontal = 4.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        // 实时开关：关掉就看原图，用来对比滤镜效果。这是"滤镜"和"实时滤镜"的区别。
+        Box(
+            Modifier
+                .clip(ChipShape)
+                .background(if (liveOn) colors.tertiary else colors.outlineVariant)
+                .clickable { onToggleLive() }
+                .padding(horizontal = 10.dp, vertical = 5.dp),
+        ) {
+            Text(
+                if (liveOn) "实时" else "关",
+                color = if (liveOn) colors.onTertiary else colors.onSurfaceVariant,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+        Spacer(Modifier.width(4.dp))
+
+        LazyRow(
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            items(LiveFilter.entries.toList()) { kind ->
+                val active = kind == selected
+                Box(
+                    Modifier
+                        .clip(ChipShape)
+                        .background(if (active) colors.primary else Color.Transparent)
+                        .clickable { onSelect(kind) }
+                        .padding(horizontal = 11.dp, vertical = 5.dp),
+                ) {
+                    Text(
+                        kind.label,
+                        color = if (active) colors.onPrimary else colors.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
+                    )
+                }
             }
         }
     }
@@ -517,31 +945,30 @@ private fun Header(state: UiState) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f)) {
-            // Product name, not a category label.  This ships to consumers, so
-            // the title is the brand; what it measures belongs in the subtitle.
             Text(
                 stringResource(R.string.app_name),
                 color = colors.onSurface,
                 style = MaterialTheme.typography.titleLarge,
             )
             Text(
-                "色差 · ΔE00 · ${state.settings.gammaLabel()}",
-                color = if (state.settings.gammaCorrected) colors.onSurfaceVariant else colors.error,
+                "实时滤镜 · 拍照 · 录像 · 参数可调",
+                color = colors.onSurfaceVariant,
                 style = MaterialTheme.typography.labelSmall,
             )
         }
-        // 仪器"面板指示灯"：一眼判断能否开始测量。
-        // 已标定=绿 / 未标定=红；曝光锁定=蓝 / 未锁=灰。
+        // 仪器"面板指示灯"：一眼判断当前状态。
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            if (state.calibration.isReady) {
-                StatusChip("已标定", colors.tertiary)
+            if (state.liveFilterOn && state.filter != LiveFilter.NONE) {
+                StatusChip("实时滤镜", colors.tertiary)
             } else {
-                StatusChip("未标定", colors.error)
+                StatusChip("原图", colors.onSurfaceVariant)
             }
-            if (state.exposureLocked) {
-                StatusChip("曝光锁", colors.secondary)
+            if (state.recording) {
+                StatusChip("录像中", colors.error)
+            } else if (state.settings.audioEnabled) {
+                StatusChip("录音", colors.secondary)
             } else {
-                StatusChip("未锁", colors.onSurfaceVariant)
+                StatusChip("静音", colors.onSurfaceVariant)
             }
         }
     }
@@ -597,270 +1024,19 @@ private fun ReticleOverlay(fraction: Double) {
 }
 
 @Composable
-private fun Readout(state: UiState) {
+private fun ShutterButton(busy: Boolean, recording: Boolean, onClick: () -> Unit) {
     val colors = MaterialTheme.colorScheme
-    val m = state.lastMeasurement
-    // 判定色贯穿整张卡：顶部色条 + 徽章 + ΔE 数字同色，扫一眼就知道结果。
-    val verdictTint = when (m?.passed) {
-        true -> colors.tertiary
-        false -> colors.error
-        null -> colors.outline
-    }
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp)
-            .clip(PanelShape)
-            .background(colors.surface)
-            .border(1.dp, colors.outlineVariant, PanelShape),
-    ) {
-        Box(Modifier.fillMaxWidth().height(3.dp).background(verdictTint))
-
-        Column(Modifier.padding(start = 14.dp, end = 14.dp, top = 10.dp, bottom = 12.dp)) {
-            // 第一层：色块 + ΔE 主读数 + 判定徽章 —— 整个界面最大的数字。
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                SampleSwatch(m?.lab)
-                Spacer(Modifier.width(12.dp))
-                Column(Modifier.weight(1f)) {
-                    Text("ΔE00", color = colors.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
-                    Text(
-                        if (m == null) "—.——" else Format.de(m.deltaE),
-                        color = when (m?.passed) {
-                            false -> colors.error
-                            null -> if (m == null) colors.outline else colors.onSurface
-                            true -> colors.onSurface
-                        },
-                        style = MaterialTheme.typography.displayMedium,
-                        maxLines = 1,
-                    )
-                }
-                VerdictBadge(m)
-            }
-
-            m?.standardName?.let { name ->
-                val tol = Standards.byName(name)?.tolerance
-                Text(
-                    if (tol != null) "对比 $name · 容差 ΔE ≤ ${"%.1f".format(tol)}" else "对比 $name",
-                    color = colors.onSurfaceVariant,
-                    style = MaterialTheme.typography.labelSmall,
-                    modifier = Modifier.padding(top = 2.dp),
-                )
-            }
-
-            HorizontalDivider(Modifier.padding(vertical = 10.dp), color = colors.outlineVariant)
-
-            if (m == null) {
-                // 空态：保留 L*a*b* 刻度位，避免首次测量后卡片高度跳变。
-                Row(Modifier.fillMaxWidth()) {
-                    LabValue("L*", null, Modifier.weight(1f))
-                    LabValue("a*", null, Modifier.weight(1f))
-                    LabValue("b*", null, Modifier.weight(1f))
-                }
-                Text(
-                    if (state.calibration.isReady) "对准样品，点下方快门测量。"
-                    else "首次使用请先对白板拍「白参考」完成标定。",
-                    color = if (state.calibration.isReady) colors.onSurfaceVariant else colors.error,
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(top = 8.dp),
-                )
-            } else {
-                // 第二层：L*a*b* 三个等宽大数字，是 ΔE 的"原因"。
-                Row(Modifier.fillMaxWidth()) {
-                    LabValue("L*", m.lab[0], Modifier.weight(1f), m.standardLab?.get(0))
-                    LabValue("a*", m.lab[1], Modifier.weight(1f), m.standardLab?.get(1))
-                    LabValue("b*", m.lab[2], Modifier.weight(1f), m.standardLab?.get(2))
-                }
-                Spacer(Modifier.height(10.dp))
-                // 第三层：派生量用小号等宽字，作为参考信息。
-                Row(Modifier.fillMaxWidth()) {
-                    Metric("C*", "%.2f".format(m.lch[1]), Modifier.weight(1f))
-                    Metric("h°", "%.1f".format(m.lch[2]), Modifier.weight(1f))
-                    Metric("CCT", if (m.cct > 0) "%.0fK".format(m.cct) else "—", Modifier.weight(1f))
-                    Metric("x,y", "%.3f,%.3f".format(m.xy[0], m.xy[1]), Modifier.weight(1.4f))
-                }
-                Text(
-                    "三通道估计 · ${if (m.gammaCorrected) "GC 开" else "GC 关"}",
-                    color = colors.onSurfaceVariant,
-                    style = MaterialTheme.typography.labelSmall,
-                    modifier = Modifier.padding(top = 6.dp),
-                )
-            }
-        }
-    }
-}
-
-/** 样品色块：把测得的 Lab 反算为 sRGB 显示，让数字与"看到的颜色"对应起来。 */
-@Composable
-private fun SampleSwatch(lab: DoubleArray?) {
-    val colors = MaterialTheme.colorScheme
-    val fill = remember(lab) {
-        lab?.let {
-            val srgb = Colorimetry.xyzToSrgb(Colorimetry.labToXyz(it))
-            Color(
-                srgb[0].coerceIn(0.0, 1.0).toFloat(),
-                srgb[1].coerceIn(0.0, 1.0).toFloat(),
-                srgb[2].coerceIn(0.0, 1.0).toFloat(),
-            )
-        }
-    }
-    Box(
-        Modifier
-            .size(52.dp)
-            .clip(RoundedCornerShape(10.dp))
-            .background(fill ?: colors.surfaceVariant)
-            .border(1.dp, colors.outline, RoundedCornerShape(10.dp)),
-    )
-}
-
-/** 判定徽章：实心填充 + 中英双标，模仿仪表上的 PASS/FAIL 指示。 */
-@Composable
-private fun VerdictBadge(m: Measurement?) {
-    val colors = MaterialTheme.colorScheme
-    val (bg, fg, label) = when (m?.passed) {
-        true -> Triple(colors.tertiary, colors.onTertiary, "PASS · 通过")
-        false -> Triple(colors.error, colors.onError, "FAIL · 超差")
-        null -> Triple(Color.Transparent, colors.onSurfaceVariant, m?.verdictText() ?: "待测")
-    }
-    Box(
-        Modifier
-            .background(bg, RoundedCornerShape(8.dp))
-            .border(1.dp, if (m?.passed == null) colors.outline else bg, RoundedCornerShape(8.dp))
-            .padding(horizontal = 12.dp, vertical = 7.dp),
-    ) {
-        Text(label, color = fg, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-    }
-}
-
-/** L*a*b* 单值：小标签在上，大号等宽数字在下；有标准时附带差值 Δ。 */
-@Composable
-private fun LabValue(label: String, value: Double?, modifier: Modifier = Modifier, reference: Double? = null) {
-    val colors = MaterialTheme.colorScheme
-    Column(modifier) {
-        Text(label, color = colors.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
-        Text(
-            value?.let { "%.2f".format(it) } ?: "—",
-            color = if (value == null) colors.outline else colors.onSurface,
-            style = MaterialTheme.typography.headlineSmall,
-            maxLines = 1,
-        )
-        if (value != null && reference != null) {
-            Text("Δ%+.2f".format(value - reference), color = colors.onSurfaceVariant, style = MonoSmall)
-        }
-    }
-}
-
-@Composable
-private fun Metric(label: String, value: String, modifier: Modifier = Modifier) {
-    val colors = MaterialTheme.colorScheme
-    Column(modifier) {
-        Text(label, color = colors.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
-        Text(value, color = colors.onSurface.copy(alpha = 0.85f), style = MaterialTheme.typography.titleSmall, maxLines = 1)
-    }
-}
-
-@Composable
-private fun Controls(
-    state: UiState,
-    onShutter: () -> Unit,
-    onWhite: () -> Unit,
-    onDark: () -> Unit,
-    onGamma: (Boolean) -> Unit,
-    onStandard: (String?) -> Unit,
-    onClearCal: () -> Unit,
-    onClearHistory: () -> Unit,
-    onExportCsv: () -> Unit,
-    onExportHtml: () -> Unit,
-) {
-    val colors = MaterialTheme.colorScheme
-    val ready = state.calibration.isReady
-
-    // 控制区整体是"次要层"：小号描边按钮、弱化文字，唯一例外是快门。
-    Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
-
-        // 标定行：未标定时"白参考"按钮描红，直接告诉用户下一步该点哪里。
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            SecondaryButton("白参考", onWhite, Modifier.weight(1f), !state.busy, if (ready) null else colors.error)
-            SecondaryButton("暗参考", onDark, Modifier.weight(1f), !state.busy)
-            SecondaryButton("清除标定", onClearCal, Modifier.weight(1f), !state.busy)
-        }
-
-        Text(
-            state.calibration.describe(),
-            color = if (ready) colors.tertiary.copy(alpha = 0.8f) else colors.error,
-            style = MonoSmall,
-            maxLines = 1,
-            modifier = Modifier.padding(top = 4.dp, bottom = 2.dp),
-        )
-
-        // GC 开关与判定标准合并为一行，把纵向空间让给取景区。
-        Row(
-            Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text("GC", color = colors.onSurface, style = MaterialTheme.typography.labelMedium)
-            Spacer(Modifier.width(6.dp))
-            Switch(
-                checked = state.settings.gammaCorrected,
-                onCheckedChange = onGamma,
-                colors = SwitchDefaults.colors(
-                    checkedThumbColor = colors.onPrimary,
-                    checkedTrackColor = colors.primary,
-                    uncheckedThumbColor = colors.error,
-                    uncheckedTrackColor = colors.errorContainer,
-                    uncheckedBorderColor = colors.error,
-                ),
-            )
-            Spacer(Modifier.weight(1f))
-            StandardPicker(state, onStandard)
-        }
-
-        Spacer(Modifier.height(6.dp))
-
-        // Shutter: the primary action, so it is large and centred.
-        // 快门是全屏唯一的实心琥珀大圆；导出按钮分列两侧且为弱化描边，主次一目了然。
-        Row(
-            Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            // Export: only useful once there is something to export, but shown
-            // disabled rather than hidden so the capability is discoverable.
-            SecondaryButton("导出 CSV", onExportCsv, Modifier.weight(1f), state.measurements.isNotEmpty())
-            Spacer(Modifier.width(16.dp))
-            ShutterButton(busy = state.busy, ready = ready, onClick = onShutter)
-            Spacer(Modifier.width(16.dp))
-            SecondaryButton("导出报告", onExportHtml, Modifier.weight(1f), state.measurements.isNotEmpty())
-        }
-
-        Text(
-            when {
-                state.busy -> "测量中…"
-                ready -> "点按测量"
-                else -> "先做白参考"
-            },
-            color = if (ready) colors.onSurfaceVariant else colors.error,
-            style = MaterialTheme.typography.labelSmall,
-            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-            textAlign = TextAlign.Center,
-        )
-
-        Spacer(Modifier.height(4.dp))
-    }
-}
-
-@Composable
-private fun ShutterButton(busy: Boolean, ready: Boolean, onClick: () -> Unit) {
-    val colors = MaterialTheme.colorScheme
-    // 外环表达标定状态（绿=可测 / 红=未标定），内芯始终是主色实心圆，忙碌时整体置灰。
+    // 外环表达状态：录像中=红 / 就绪=绿 / 忙碌=灰。
     val ring = when {
         busy -> colors.outline
-        ready -> colors.tertiary
-        else -> colors.error
+        recording -> colors.error
+        else -> colors.tertiary
     }
-    val core = if (busy) colors.outline else colors.primary
+    val core = when {
+        busy -> colors.outline
+        recording -> colors.error
+        else -> colors.primary
+    }
     Box(
         Modifier
             .size(SHUTTER_SIZE)
@@ -870,125 +1046,9 @@ private fun ShutterButton(busy: Boolean, ready: Boolean, onClick: () -> Unit) {
             .background(core)
             .clickable(enabled = !busy, onClick = onClick)
             .semantics {
-                contentDescription = "快门：测量"
+                contentDescription = if (recording) "快门：停止录像" else "快门：拍照"
                 role = Role.Button
             },
     )
 }
 
-@Composable
-private fun SecondaryButton(
-    text: String,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-    enabled: Boolean = true,
-    emphasis: Color? = null,
-) {
-    val colors = MaterialTheme.colorScheme
-    val tint = emphasis ?: colors.onSurface
-    OutlinedButton(
-        onClick = onClick,
-        modifier = modifier.height(36.dp),
-        enabled = enabled,
-        shape = RoundedCornerShape(8.dp),
-        contentPadding = ButtonDefaults.TextButtonContentPadding,
-        border = androidx.compose.foundation.BorderStroke(
-            1.dp,
-            if (!enabled) colors.outlineVariant else emphasis ?: colors.outline,
-        ),
-        colors = ButtonDefaults.outlinedButtonColors(
-            contentColor = tint,
-            disabledContentColor = colors.onSurfaceVariant.copy(alpha = 0.5f),
-        ),
-    ) { Text(text, style = MaterialTheme.typography.labelMedium, maxLines = 1) }
-}
-
-@Composable
-private fun StandardPicker(state: UiState, onStandard: (String?) -> Unit) {
-    val colors = MaterialTheme.colorScheme
-    var expanded by remember { mutableStateOf(false) }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("判定标准", color = colors.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
-        Spacer(Modifier.width(8.dp))
-        Box {
-            val active = state.activeStandard
-            SecondaryButton(
-                text = if (active == null) "未选 ▾" else "${active.name} ≤${"%.1f".format(active.tolerance)} ▾",
-                onClick = { expanded = true },
-            )
-            // 标准的 Lab 值移入下拉项副行，主界面这一行只保留名称与容差。
-            DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                DropdownMenuItem(
-                    text = { Text("未选（只记录）") },
-                    onClick = { onStandard(null); expanded = false },
-                )
-                Standards.all.forEach { std ->
-                    DropdownMenuItem(
-                        text = {
-                            Column {
-                                Text("${std.name}   ΔE≤${"%.1f".format(std.tolerance)}")
-                                Text(
-                                    "L*%.0f a*%.0f b*%.0f".format(std.lab[0], std.lab[1], std.lab[2]),
-                                    color = colors.onSurfaceVariant,
-                                    style = MonoSmall,
-                                )
-                            }
-                        },
-                        onClick = { onStandard(std.name); expanded = false },
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun History(measurements: List<Measurement>) {
-    val colors = MaterialTheme.colorScheme
-    // 记录区是最弱的一层：无边框、更深的底色、小号等宽字，只在需要回看时才被注意到。
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 6.dp)
-            .background(colors.surfaceVariant.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
-            .padding(horizontal = 10.dp, vertical = 8.dp),
-    ) {
-        Text("记录 · ${measurements.size}", color = colors.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
-        Spacer(Modifier.height(4.dp))
-        LazyColumn(Modifier.height(84.dp)) {
-            items(measurements.reversed()) { m ->
-                val tint = when (m.passed) {
-                    true -> colors.tertiary
-                    false -> colors.error
-                    null -> colors.onSurfaceVariant
-                }
-                Row(
-                    Modifier.fillMaxWidth().padding(vertical = 3.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Box(Modifier.size(6.dp).background(tint, CircleShape))
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        m.label,
-                        color = colors.onSurfaceVariant,
-                        style = MonoSmall,
-                        modifier = Modifier.width(34.dp),
-                    )
-                    Text(
-                        m.summary(),
-                        color = colors.onSurface,
-                        style = MonoSmall,
-                        maxLines = 1,
-                        modifier = Modifier.weight(1f),
-                    )
-                    Text(
-                        m.verdictText(),
-                        color = tint,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                    )
-                }
-            }
-        }
-    }
-}

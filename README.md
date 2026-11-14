@@ -1,10 +1,12 @@
-# 色差计（Android）
+# 光年相机（Android）
 
-手机三点测色 App：**快门 → 白参考 → 测量 → ΔE00 判定**，带 GC 伽马开关、显示滤镜与报告导出。
+一台能用的相机：**实时滤镜 · 拍照 · 录像 · 参数可调**。底层还带着测色能力（白参考 → ΔE00 判定），
+但那不再是主界面 —— 现在打开就是一个相机。
 
 - 包名：`com.spectradesk.camera`
 - 目标：Android 8.0+（minSdk 26）
-- 实测：Motorola XT2551-3 / Android 16、vivo V2352A / Android 16
+- 实测：Motorola XT2551-3 / Android 16、vivo V2352A / Android 16、
+  Android 模拟器 API 34（x86_64，`Zhihui_API_34`）
 - 大小：release 11.8 MB
 
 ```
@@ -12,9 +14,9 @@ spectradesk-android/
   app/build/outputs/apk/release/app-release.apk   ← 装机用这个
   app/build/outputs/apk/debug/app-debug.apk       ← 带日志
   branding/                                        ← 图标源文件与生成脚本
-  screenshots/                                     ← 图标与界面截图
+  screenshots/                                     ← 界面截图（含 lightyear-* 实机验证）
   build_apk.bat                                    ← 一键构建+安装
-  run_tests.py                                     ← 跑单元测试（61 项）
+  run_tests.py                                     ← 跑单元测试（80 项）
 ```
 
 ![icon](screenshots/00-icon.png)
@@ -22,12 +24,113 @@ spectradesk-android/
 图标语义：三个彩色采样点连成三角形，**Δ 三角形呼应 ΔE 色差**，中心准星表示精确测量。
 由 `branding/generate_icons.py` 生成（8× 超采样 + 自动验证安全区），已接入 adaptive icon。
 
-## 它不是光谱仪
+## 一、功能
+
+| 功能 | 状态 | 说明 |
+|---|---|---|
+| 实时滤镜 | ✅ | 8 种观感，GPU 片元着色器，30 fps |
+| 滤镜强度 | ✅ | 0–100% 连续可调，实时生效 |
+| **手动调色** | ✅ | 10 项滑杆 + 7 个预设，参考剪映/醒图 |
+| **前后置切换** | ✅ | 一键切换，前置自动镜像 |
+| 拍照 | ✅ | 存入相册 `Pictures/LightYear` |
+| 录像 | ✅ | H.264 MP4，1080×1920，存入 `Movies/LightYear` |
+| 录音 | ✅ | 可开关；未授权时静默降级为无声录像 |
+| 变焦 | ✅ | 滑杆 + 快捷档位（0.6/1/2/3/5/10×） |
+| 曝光补偿 | ✅ | ±EV，步长按设备实测（这台是 1/10 EV） |
+| 参数面板 | ✅ | 浮层 + 可滚动，不挤压取景器 |
+
+实测截图：
+
+| 实时滤镜 | 参数面板（全） | 调色 · 胶片预设 |
+|---|---|---|
+| ![live](screenshots/lightyear-01-live.png) | ![params](screenshots/lightyear-20-params-full.png) | ![film](screenshots/lightyear-21-grade-film.png) |
+
+调色效果是**实时**的，且**烧进视频**：
+
+| 调色后的取景器 | 前置（镜像） | 从录制视频抽帧 |
+|---|---|---|
+| ![grade](screenshots/lightyear-22-grade-live.png) | ![front](screenshots/lightyear-23-front.png) | ![video](screenshots/lightyear-24-video-graded.png) |
+
+**滤镜确实烧进了视频**，不是只在取景器里做样子。从录好的 MP4 抽帧：
+
+| 黑白滤镜录制的视频 | 冷调滤镜录制的视频 |
+|---|---|
+| ![mono](screenshots/lightyear-06-video-mono.png) | ![cool](screenshots/lightyear-07-video-cool.png) |
+
+## 一·补、调色为什么单独一层
+
+`LiveFilter` 是**预设**（选一个名字，整张画面观感就定了），`ColorGrade` 是**滑杆**
+（逐项微调，作用在预设之后的成品画面上）。两者串联，顺序和剪辑软件一致。
+
+关键决定：**预设在线性光里算，滑杆在 sRGB 域里算**。
+
+| 层 | 域 | 为什么 |
+|---|---|---|
+| 预设滤镜 | 线性光 | 色彩运算的物理正确域；测色仪器必须这样 |
+| 手动调色 | sRGB | 滑杆是**感知**控制，用户拿它和剪映对比，而剪映在 sRGB 域里做 |
+
+把同一个对比度公式搬进线性光，中灰会被推坏，用户拉一下就"觉得不对"。
+所以分工是：预设保色彩保真，滑杆保操作手感。
+
+这十项是照着参考应用的实际实现挑的。用 REA 静态分析 Google Photos 的 APK，
+它自带的 filterfw 图元里就有 `ColorTemperatureFilter`、`ContrastFilter`、
+`VignetteFilter`、`GrainFilter`、`SharpenFilter`、`SaturateFilter` ——
+和这里的色温、对比度、暗角、颗粒、锐化、饱和度一一对应。
+
+调色**永远不进测量**：测量读的是 `ImageCapture` 的原始输出，连 GL 管线都不经过。
+
+## 二、实时滤镜怎么做的
+
+### 数据流
+
+```
+Camera ──► Preview use case ──► SurfaceRequest
+                                     │
+                          自己建 SurfaceTexture (OES)
+                                     ▼
+                              fragment shader
+                                     │
+                       ┌─────────────┴─────────────┐
+                       ▼                           ▼
+               取景器 SurfaceView          录像编码器 Surface
+                 （自己持有）              （CameraEffect 给）
+```
+
+预览和录像走**同一套 shader**，所以录下来的就是你在取景器里看到的。
+
+### 为什么不直接用 PreviewView
+
+上一版用 `PreviewView` + `CameraEffect(PREVIEW|VIDEO_CAPTURE|IMAGE_CAPTURE)`，
+预览上下出现黑边。排查过程值得记下来，因为每一步都排除了一个错误假设：
+
+1. **怀疑 GL 裁剪算错** → 打印矩阵，发现 `updateTransformMatrix` 返回的已经含裁剪
+   （`scaleY = -0.785`，正好是 ViewPort 比例）。GL 是对的。
+2. **怀疑 ViewPort 没生效** → 三次对照（有 ViewPort / 无 ViewPort / 改 targetRotation），
+   黑边位置一模一样。不是 ViewPort 的事。
+3. **怀疑自己的 GL 画错** → 把清屏色改成红色、把 shader 改成纯绿输出。
+   红色从没出现，绿色铺满整个取景框。**GL 覆盖范围完全正常。**
+4. **真正的原因**：接入 `SurfaceProcessor` 后，CameraX 交给 PreviewView 的裁剪信息是
+   竖屏 `754×1280`，而 effect 的输出缓冲是横向 `1280×960`，两者互为转置。
+   PreviewView 不知道画面已经被 GL 处理过，会**再套一次**自己的
+   `PreviewTransformation`，把已经画满的画面按竖屏比例又做了一次信箱（letterbox）。
+
+这个冲突在 PreviewView 内部无解。所以取景器换成自己持有 Surface 的 `PreviewSurfaceView`，
+几何 100% 由 GL 管线决定，没有第二个人再动它。
+
+### 两个踩过的坑
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| 预览全黑 | `surfaceCreated` 早于 GL 处理器就绪，事件被丢弃 | `PreviewSurfaceView` 记住当前表面，注册回调时补发一次 |
+| 画面被拉长 | `u_matrix` 含 90° 旋转，填充裁剪用错了未旋转的纵横比 | 检测四分之一转，交换宽高再算裁剪 |
+| 参数面板一开就黑边 | 面板挤压取景器 → SurfaceView 缓冲区重建 → 中间露出黑底 | 参数面板改成取景器内的浮层 |
+
+## 三、测量能力（仍在，但不再是主界面）
 
 手机相机只有三个宽通道（大致对应红/绿/蓝），**物理上不可能测出光谱**。
 三通道到光谱的映射是无穷多解的，任何"重建出来的曲线"都是先验假设的产物，不是测量。
 
-所以这个 App 只做它真能做到的事：
+所以测量部分只做它真能做到的事：
 
 | 能做 | 不能做 |
 |---|---|
@@ -36,9 +139,13 @@ spectradesk-android/
 | 判定合格/超差 | 同色异谱分析 |
 | 导出 CSV / HTML 报告 | 绝对精度（无出厂标定） |
 
-要真光谱，得上多光谱模组——桌面版 `spectradesk` 支持（9/16/64 通道）。
+**滤镜与测量的边界是硬的**：`CameraEffect` 的 targets 只含 `VIDEO_CAPTURE`，
+不含 `IMAGE_CAPTURE`。测量读的是 `ImageCapture` 的原始输出，滤镜永远进不了数字。
+滤镜作用于"你看到的"和"你录下的"，测量走未处理的原图。
 
-## 一、安装
+`FiltersTest` 里有一条测试专门钉死"只有 NONE 和 GRID 是 measurement-safe"。
+
+## 四、安装
 
 ```powershell
 $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
@@ -50,96 +157,28 @@ $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 
 > **release 用 debug 签名**。自己装没问题；要上应用商店必须换正式签名。
 
-## 二、界面
+## 五、模拟器上验证
 
-![new ui](screenshots/10-new-ui.png)
+本项目在 Android 模拟器上完整验证过（`Zhihui_API_34`，Android 14 / API 34，x86_64）：
 
-主界面：取景区最大，读数卡突出（ΔE 大数字 + L\*a\*b\*），控制区紧凑。右上角两枚状态灯
-（标定状态 / 曝光锁），取景区底部是滤镜栏。
+```powershell
+# 启动（带摄像头映射，模拟器会把宿主摄像头当作相机）
+$emu = "$env:LOCALAPPDATA\Android\Sdk\emulator\emulator.exe"
+& $emu -avd Zhihui_API_34 -gpu host -camera-back webcam0 -no-snapshot-load
+```
 
-| 旧版相机预览 | 标准选择 | 判定通过 | 超差 |
-|---|---|---|---|
-| ![preview](screenshots/01-camera-preview.png) | ![standards](screenshots/03-standard-picker.png) | ![pass](screenshots/02-measure-pass.png) | ![fail](screenshots/04-verdict.png) |
+实测结论：
 
-## 三、怎么用
+- GL 管线稳定 **30 fps**（`EGL_emulation: app_time_stats avg=33.3ms`）
+- 预览 `1016×1724` 铺满取景器，无黑边
+- 照片：`/sdcard/Pictures/LightYear/LightYear_*.jpg`
+- 视频：`/sdcard/Movies/LightYear/LightYear_*.mp4`，H.264 / 1080×1920 / 30fps / AAC 立体声
+- 从 MP4 抽帧确认滤镜**和调色**都已编码进视频（见上方对比图）
 
-1. **开相机**：启动即请求权限，预览自动出现。
-2. **白参考**：把白纸/白卡铺满中间取景框（四角括号），点「白参考」。
-   这一步会**自动锁定曝光和白平衡**（右上角显示「曝光已锁」）。
-3. **选标准**（可选）：判定标准 → 灰 50 / 灰 90 / 陶瓷白 / 纺织青 / 氧化铁红 / 浅肤色。
-4. **按快门**：中间大圆钮。出 L\*a\*b\*、C\*、h、CCT、xy，有标准时给 ΔE00 和通过/超差。
-5. **导出**：CSV（表格软件打开）或 HTML 报告（单文件，断网也能看，带色块预览）。
+**模拟器的限制**：变焦不支持（`zoomRange` 返回 1.0–1.0），所以变焦滑块显示"此设备不支持变焦"。
+真机上可用。
 
-**为什么必须先做白参考**：相机通道增益未知且随光源变化。没标定时点快门，软件会
-拒绝并解释，而不是给你一个看起来合理的假数字。
-
-**为什么要锁曝光**：如果 AE/AWB 自由运行，拍白参考和拍样品之间曝光会变，
-除以白参考就等于拿两台不同的相机在比。锁定后两者共享同一物理状态。
-这是精度上最关键的一步，实测能把重复性从「漂几个 ΔE」压到「稳定在 1 个以内」。
-
-**为什么取中心区域的中位均值**：一块 18% 边长的中心区域，去掉最暗和最亮各 10%
-再平均。单个反光点或灰尘不会拖偏读数——这和手持色差仪用小孔径平均是一个道理。
-
-## 四、显示滤镜
-
-取景区底部有一排滤镜，**只影响你看的方式，不影响测出来的数**。这不是随手加的：
-
-| 滤镜 | 用途 |
-|---|---|
-| 原图 | 不做处理（测量始终走这条路径的数据） |
-| 灰度 | 去掉颜色只看明暗，判断表面均匀性 |
-| 边缘 | Sobel 边缘，看平整度和边界 |
-| 伪彩 | 亮度映射色阶（蓝→青→绿→黄→红），找亮度不均 |
-| 削波 | 过曝标红、欠曝标蓝。**最实用**：过曝的高光永久丢失颜色信息，补不回来 |
-| 网格 | 九宫格 + 同心圆，辅助对位 |
-
-启用会改像素的滤镜时，右上角显示「滤镜仅影响显示」红标。滤镜作用在**已抓拍的帧**上
-（不是实时预览流）：实时滤镜需要 `SurfaceProcessor` + GL 管线，而处理静帧能达到同样的
-观察效果，复杂度和风险都低一个数量级。
-
-代码层面这条边界是硬的：`Filters.apply` 只碰预览拷贝，测量读的是未处理的抓拍原图。
-`FiltersTest` 里有一条测试专门钉死"只有 NONE 和 GRID 是 measurement-safe"。
-
-## 五、GC 伽马开关
-
-这是整个 App 唯一一个**会改变物理含义**的开关，所以它同时显示在右上角、GC 行、
-每条记录里。
-
-| | 含义 | 什么时候用 |
-|---|---|---|
-| **GC 开**（默认） | 帧按 sRGB 分段曲线反解为线性光再计算 | 手机相机、普通 USB 相机 |
-| **GC 关** | 帧当已经线性，不反解 | 只有工业相机输出本来就是线性时 |
-
-**实测差异**（同一场景，白参考读数）：
-
-| GC | 白参考线性值 | 说明 |
-|---|---|---|
-| 开 | 0.312, 0.299, 0.274 | sRGB 解码后 |
-| 关 | 0.595, 0.576, 0.560 | 原始字节当线性 |
-
-差了约 1.9 倍。**切换 GC 会自动清空标定**——旧的白参考是在另一个物理域测的，
-拿它去除新读数会得到一个看似合理的错误颜色。
-
-## 六、数值正确性
-
-| 项目 | 实测 | 理论值 |
-|---|---|---|
-| 白参考的 L\*a\*b\* | 100.11, −0.12, 0.38 | 100, 0, 0 |
-| 白参考 CCT | 6472 K | 6504 K (D65) |
-| 中灰（线性 0.5）L\* | 76.07 | 76.07 |
-
-**61 项单元测试**覆盖：
-
-- CIEDE2000 与 Sharma 等（2005）公开测试对逐条比对（容差 1e-4）
-- 线性 RGB → XYZ → Lab 的白点、中灰、三原色方向
-- sRGB 解码曲线（含暗部线性段）
-- 标定门槛：过暗 / 过曝 / 偏色的白参考必须被拒绝
-- GC 切换清标定，以及**在途旧模式帧被拒收**
-- 黑样品不产生虚假色温
-- 滤镜不污染测量（只有 NONE / GRID 是 measurement-safe）
-- 每条记录保存自己的曝光锁状态（导出不改写历史）
-
-## 七、这台机器上构建的坑（重要）
+## 六、这台机器上构建的坑
 
 **Gradle 的单元测试任务在这台机器上跑不起来**，报 `ClassNotFoundException`，
 但类文件明明存在。根因是项目路径含中文（`E:\灰度地带\`）+ JVM 的
@@ -147,7 +186,7 @@ $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 
 `run_tests.py` 绕过这个问题：**cd 到 `app/build` 用相对路径**（纯 ASCII），
 依赖 jar 从 Gradle 缓存按需取，AndroidX 的 AAR 现场解压出 `classes.jar`。
-它跑的是同一批编译产物和同一个 JUnit，所以绿灯是可信的。
+它跑的是同一批编译产物和同一个 JUnit，所以绿灯是可信的。当前 **80 项全过**。
 
 其他踩过的坑：
 
@@ -160,8 +199,15 @@ $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 | 快门卡住不动 | 12MP JPEG 全图逐像素解码，约 1.6 秒且在主线程 | 降采样到 1200px + 移到 `Dispatchers.Default`，降到 63 ms |
 | **L\* = 115** | 用三通道伪造光谱曲线算 Lab，白点归一化错误 | 改走 线性RGB→XYZ→Lab，不伪造光谱 |
 | 切 GC 后读数不合理 | 旧白参考在新物理域里被复用 | 切 GC 即清标定 |
+| 照片存不进相册 | 自己 insert 一行占位，CameraX 内部又 insert 一次，撞车抛异常 | 改用 `OutputStream`，只插一次 |
+| `-P` 参数被吞 | PowerShell 把 `-Pandroid.overridePathCheck=true` 当成任务名 | 写进 `gradle.properties`，命令行不带 |
+| `Unable to delete directory 'app\build\outputs\apk\release'` | **adb server 一直持有 `app-release.apk`** | `adb kill-server` 后再构建；或先 `push` 到 `/data/local/tmp` 再 `pm install` |
+| 变焦永远 1.0× 起 | 滑杆下界写死 `1f`，且 `requireLensFacing` 会在 filter 前就收窄候选 | 下界改用 `zoomState.minZoomRatio`；朝向过滤自己写在 `addCameraFilter` 里 |
+| `UnsupportedOperationException` in CameraFilter | filter 回调里读 `info.zoomState.value`，那时相机未绑定 | 改读 Camera2 静态特性 `CONTROL_ZOOM_RATIO_RANGE` |
+| 曝光显示 `+1.3 EV` 实际只补了 0.7 | EV 步长写死 `/3.0`，这台设备是 1/10 | 读 `CONTROL_AE_COMPENSATION_STEP` |
+| vivo 装不上（只有"取消安装"） | 超级守护管控非官方来源应用 | 手动点蓝色"授权本次安装"；授权一次后 `pm install` 就通了 |
 
-## 八、已知边界
+## 七、已知边界
 
 - **手机是色差计，不是光谱仪。** 三个宽通道决定不了光谱，App 只报颜色，
   不报光谱曲线。要光谱得上多光谱模组（桌面版支持）。
@@ -173,19 +219,43 @@ $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
   用带边界色块可以看出来。修法是 `UseCaseGroup` + `ViewPort`，还没做。
 - **AE/AWB 锁是软锁。** 通过 `Camera2Interop` 设置，个别厂商 ROM 可能忽略；
   锁失败时右上角会显示「曝光未锁」，不会假装成功。
-- **滤镜作用于已抓拍的帧**，不是实时预览流。取景时看到的是原图。
-- **只有后置摄像头**，没有 RAW、没有手电筒常亮。
-- **导出走系统分享**，文件在缓存目录，系统可能清理。
+- **只有后置/前置两路**，没有 RAW、没有手电筒常亮。
+- **0–1 区间（超广角）变焦拿不到 —— 这是平台限制，不是没做。** 详见下节。
 - **历史只在内存**，进程被杀即丢失。
+- **变焦/曝光补偿依赖设备能力**，不支持的设备上滑块会显示提示而不是假装可用。
 
-## 九、下一步
+### 为什么这台 vivo 没有 0.6× 超广角
+
+实测 vivo V2352A / Android 16 有 **8 个 camera device**，其中一颗后置逻辑相机
+`zoomRatioRange = [0.6, 10.0]`、`logicalMultiCamera.physicalIds = [3, 0]`
+（超广角 + 主摄）—— 硬件上确实有超广角。
+
+但**第三方应用只能看到 2 个**：
+
+```
+CameraManager.cameraIdList  →  ["0", "1"]
+   id=0  facing=BACK   zoomRatioRange = 1.0..10.0
+   id=1  facing=FRONT  zoomRatioRange = 1.0..10.0
+```
+
+`ProcessCameraProvider.getAvailableCameraInfos()` 同样只返回 2 个，
+`dumpsys media.camera` 的连接记录也只有 `device 0` / `device 1`。
+那颗 0.6 起的相机在 vivo 的私有 HAL 通道里，只对系统相机开放。
+
+代码里两条路都试过了（`CameraSelector.addCameraFilter` 按 zoom 下限挑、
+`CameraManager` 枚举全部 cameraId 精确匹配），结论一致：**看不到就绑不上**。
+所以变焦滑杆的下界取 `zoomState.minZoomRatio` 而不是写死 1.0 ——
+换一台把超广角暴露出来的机器，0.6× 会直接出现在滑杆左端，不需要改代码。
+
+## 八、下一步
 
 1. **准星与采样区对齐**：`UseCaseGroup` + `ViewPort` 共享视口，这是目前最明显的
    精度隐患——框住的区域和被采样的区域必须严格是同一块。
-2. **多点平均**：现在只取中心一块；改成 3×3 多点取中位数能进一步降噪。
-3. **RAW/DNG**：这两台机器都支持 `capability.raw`，走 RAW 能绕开厂商 ISP 的调色，
-   这是唯一能接近「真实测量」的路。
-4. **标定卡**：印一张已知色块卡，App 自动识别并做多点校正，能部分补偿
+2. **3D LUT 滤镜**：现在的 8 种观感是解析式（数学公式）。真实相机 App 用
+   33³ 或 17³ 的 LUT 文件（InstaShot 和 Google Photos 都是），
+   `LiveFilters.sampleLut` 已经写好三线性插值，接文件即可。
+3. **RAW/DNG**：走 RAW 能绕开厂商 ISP 的调色，这是唯一能接近「真实测量」的路。
+4. **多点平均**：现在只取中心一块；改成 3×3 多点取中位数能进一步降噪。
+5. **标定卡**：印一张已知色块卡，App 自动识别并做多点校正，能部分补偿
    手机相机非理想的光谱响应。
-5. **接外接模块**：AS7265x（13 通道）或 Spectricity S1-A（15 通道）走 USB/蓝牙，
-   手机当上位机——那时才真的是光谱仪。
+6. **网格线 / 画幅比例 / 定时器**：参考应用都有的取景辅助，下一步补齐。

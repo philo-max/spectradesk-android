@@ -29,6 +29,14 @@ data class UiState(
      */
     val shotCounter: Int = 0,
     val message: String? = null,
+    /** 正在录像。 */
+    val recording: Boolean = false,
+    /** 录像已录时长，秒。 */
+    val recordingSeconds: Int = 0,
+    /** 参数面板是否展开。 */
+    val paramsOpen: Boolean = false,
+    /** 是否显示实时滤镜（关掉可对比原图）。 */
+    val liveFilterOn: Boolean = true,
 ) {
     val activeStandard: ColorStandard?
         get() = activeStandardName?.let { Standards.byName(it) }
@@ -225,6 +233,129 @@ class CameraViewModel : ViewModel() {
      */
     fun setFilter(kind: LiveFilter) {
         _state.update { it.copy(filter = kind) }
+    }
+
+    /** 实时滤镜强度。 */
+    fun setFilterIntensity(value: Float) {
+        _state.update { it.copy(settings = it.settings.copy(filterIntensity = value.coerceIn(0f, 1f))) }
+    }
+
+    /** 是否启用实时滤镜（关掉 = 看原图对比）。 */
+    fun setLiveFilterOn(on: Boolean) {
+        _state.update { it.copy(liveFilterOn = on) }
+    }
+
+    /** 变焦。范围由设备决定，可能从 0.6 起（超广角）。 */
+    fun setZoom(ratio: Float, range: ClosedFloatingPointRange<Float> = 1f..10f) {
+        _state.update {
+            it.copy(settings = it.settings.copy(zoomRatio = ratio.coerceIn(range)))
+        }
+    }
+
+    /** 切换前后置。切换会重建相机管线，所以同时把变焦复位到该镜头的下限。 */
+    fun toggleLens() {
+        _state.update {
+            val next = if (it.settings.lensFacing ==
+                androidx.camera.core.CameraSelector.LENS_FACING_BACK
+            ) {
+                androidx.camera.core.CameraSelector.LENS_FACING_FRONT
+            } else {
+                androidx.camera.core.CameraSelector.LENS_FACING_BACK
+            }
+            it.copy(
+                settings = it.settings.copy(lensFacing = next, zoomRatio = 1f),
+                message = if (next == androidx.camera.core.CameraSelector.LENS_FACING_FRONT) {
+                    "已切到前置（镜像）"
+                } else {
+                    "已切到后置"
+                },
+            )
+        }
+    }
+
+    /** 手动调色：拖滑杆时高频调用，只写状态，不下发相机。 */
+    fun setGradeChannel(channel: ColorGrade.Channel, value: Float) {
+        _state.update {
+            val next = channel.set(it.settings.grade, value.coerceIn(channel.min, channel.max))
+            it.copy(
+                settings = it.settings.copy(grade = next, gradePreset = null),
+            )
+        }
+    }
+
+    /** 应用一个调色预设。 */
+    fun applyGradePreset(name: String) {
+        val preset = ColorGrade.presets.firstOrNull { it.first == name } ?: return
+        _state.update {
+            it.copy(settings = it.settings.copy(grade = preset.second, gradePreset = name))
+        }
+    }
+
+    /** 还原全部调色。 */
+    fun resetGrade() {
+        _state.update {
+            it.copy(
+                settings = it.settings.copy(grade = ColorGrade.NONE, gradePreset = "原片"),
+                message = "调色已还原",
+            )
+        }
+    }
+
+    /**
+     * 曝光补偿。
+     *
+     * 这是唯一一个既改观感又改测量读数的参数 —— 换曝光等于换了物理条件，
+     * 旧的白参考不再成立。所以改它要清标定，和切 GC 同理。
+     */
+    fun setExposureIndex(index: Int) {
+        _state.update { current ->
+            if (current.settings.exposureIndex == index) return@update current
+            current.copy(
+                settings = current.settings.copy(exposureIndex = index),
+                calibration = CalibrationState(),
+                exposureLocked = false,
+                message = "曝光补偿已改（%+.1f EV）：标定已清除，请重做白参考"
+                    .format(index / 3.0),
+            )
+        }
+    }
+
+    /**
+     * 用设备真实的曝光范围夹住当前索引。
+     *
+     * 相机绑定前拿不到范围，滑块可能把索引推到设备不支持的档位
+     * （实测出现过 -3.7 EV，而真机范围远小于此）。绑定完成后用它校正一次，
+     * 越界就归零并说明，而不是让一个不存在的档位留在状态里。
+     */
+    fun clampExposureIndex(range: IntRange) {
+        if (range.last <= range.first) return
+        _state.update { current ->
+            val idx = current.settings.exposureIndex
+            if (idx in range) current
+            else current.copy(
+                settings = current.settings.copy(exposureIndex = 0),
+                calibration = CalibrationState(),
+                exposureLocked = false,
+                message = "曝光补偿超出设备范围，已归零",
+            )
+        }
+    }
+
+    /** 录像是否录音。 */
+    fun setAudioEnabled(on: Boolean) {
+        _state.update { it.copy(settings = it.settings.copy(audioEnabled = on)) }
+    }
+
+    fun setRecording(recording: Boolean) {
+        _state.update { it.copy(recording = recording, recordingSeconds = if (!recording) 0 else it.recordingSeconds) }
+    }
+
+    fun setRecordingSeconds(seconds: Int) {
+        _state.update { it.copy(recordingSeconds = seconds) }
+    }
+
+    fun setParamsOpen(open: Boolean) {
+        _state.update { it.copy(paramsOpen = open) }
     }
 
     /**
