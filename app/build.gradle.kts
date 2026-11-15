@@ -24,7 +24,9 @@ android {
             // Unsigned-by-default: a self-signed release build would be rejected
             // by the store later and confuses side-loading, so debug signing is
             // used for the deliverable and noted in the README.
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
             signingConfig = signingConfigs.getByName("debug")
         }
     }

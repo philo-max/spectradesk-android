@@ -7,7 +7,8 @@
 - 目标：Android 8.0+（minSdk 26）
 - 实测：Motorola XT2551-3 / Android 16、vivo V2352A / Android 16、
   Android 模拟器 API 34（x86_64，`Zhihui_API_34`）
-- 大小：release 11.8 MB
+- 大小：release 1.95 MB（开启 R8 代码压缩 + 资源压缩，原为 12.4 MB；
+  反编译显示未压缩时 17,880 个类里只有 54 个是本项目代码）
 
 ```
 spectradesk-android/
