@@ -122,14 +122,13 @@ class CameraController(private val context: Context) {
         //
         // 顺序很重要：先摘掉取景器回调（否则旧处理器还会收到 surface 事件），
         // 再 release（它会 quitSafely 自己的线程）。
-        filterProcessor?.let { old ->
-            Log.i(TAG, "bind: releasing previous processor")
-            runCatching { old.release() }
-        }
-        filterProcessor = null
-        // 旧处理器注册在 PreviewSurfaceView 上的回调也要清掉，新处理器会重装。
         previewView.onSurfaceAvailable = null
         previewView.onSurfaceSizeChanged = null
+        filterProcessor?.let { old ->
+            Log.i(TAG, "bind: releasing previous processor")
+            suspendCancellableCoroutine { cont -> old.release { cont.resume(Unit) } }
+        }
+        filterProcessor = null
 
         // 处理器先建好：预览的 SurfaceProvider 要用它，取景器的 Surface 也要挂上去。
         val processor = GlFilterProcessor().apply {

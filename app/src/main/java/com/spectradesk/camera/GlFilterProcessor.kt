@@ -134,7 +134,11 @@ class GlFilterProcessor : SurfaceProcessor {
 
     private val glThread = HandlerThread("gl-filter").apply { start() }
     private val glHandler = Handler(glThread.looper)
-    private val glExecutor = Executor { glHandler.post(it) }
+    @Volatile
+    private var glThreadQuit = false
+    private val glExecutor = Executor { task ->
+        if (glThreadQuit) task.run() else glHandler.post(task)
+    }
 
     // EGL
     private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
@@ -787,9 +791,12 @@ class GlFilterProcessor : SurfaceProcessor {
         }
     }
 
-    fun release() {
+    fun release(onReleased: (() -> Unit)? = null) {
         glExecutor.execute {
-            if (released) return@execute
+            if (released) {
+                onReleased?.invoke()
+                return@execute
+            }
             released = true
             releasePreviewInput()
             releaseVideoInput()
@@ -826,8 +833,10 @@ class GlFilterProcessor : SurfaceProcessor {
                 tempSurface = EGL14.EGL_NO_SURFACE
                 initialized = false
             }
+            glThreadQuit = true
             glThread.quitSafely()
             Log.i(TAG, "released")
+            onReleased?.invoke()
         }
     }
 
