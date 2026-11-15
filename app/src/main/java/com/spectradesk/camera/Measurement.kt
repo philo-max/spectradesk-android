@@ -70,10 +70,27 @@ data class CameraSettings(
     val frameAspect: FrameAspect = FrameAspect.RATIO_16_9,
     /** 水印。默认关闭，用户主动开。 */
     val watermark: Watermark = Watermark(),
-    /** 超广角（物理相机切换），只在设备有这颗镜头时可用。 */
+    /**
+     * 超广角走**物理子相机**（只在逻辑相机不能 <1× 时用）。
+     * 能靠 zoomRatio<1 切超广角的机器上这个字段不起作用，超广角就是变焦的一段。
+     */
     val ultraWide: Boolean = false,
-    /** 手动对焦屈光度；null = 自动对焦。 */
+    /** 手动对焦屈光度；null = 自动对焦，0 = 无穷远。 */
     val manualFocus: Float? = null,
+    /** 录像分辨率档位（720p ~ 8K）。 */
+    val videoResolution: VideoResolution = VideoResolution.FHD,
+    /** 录像帧率档位（24 ~ 240fps）。 */
+    val videoFps: Int = 30,
+    /** 算法画质增强档位（标准 / 高清 HydraSharp / 超清多尺度重构 / 超清HDR）。 */
+    val clarityMode: ClarityMode = ClarityMode.HD,
+    /** 硬件防抖 + 3DNR 协同（EIS/OIS 视频防抖 + 硬件色散校正）。 */
+    val videoStabilization: Boolean = true,
+    /** 闪光灯 / 补光档位（关闭 / 自动 / 开启 / 常亮补光）。 */
+    val flashMode: FlashMode = FlashMode.OFF,
+    /** 前置屏幕柔光环色温（暖阳柔光 / 自然冷白 / 蜜桃粉光）。 */
+    val screenFlashTone: ScreenFlashTone = ScreenFlashTone.WARM,
+    /** 重力感应电子水平仪（LevelerView）开关。 */
+    val levelerEnabled: Boolean = true,
 ) {
     fun gammaLabel(): String =
         if (gammaCorrected) "GC 开 · sRGB→线性" else "GC 关 · 按线性处理"

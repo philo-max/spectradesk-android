@@ -154,7 +154,7 @@ object FrameDecoder {
      * subsampled to at most [MAX_DECODE_EDGE] on the long edge: still far more
      * pixels than the reticle covers, at a quarter of the memory.
      */
-    fun imageProxyToBitmap(image: ImageProxy): Bitmap {
+    fun imageProxyToBitmap(image: ImageProxy, maxEdge: Int = MAX_DECODE_EDGE): Bitmap {
         require(image.format == android.graphics.ImageFormat.JPEG) {
             "expected a JPEG image, got format ${image.format}"
         }
@@ -168,11 +168,17 @@ object FrameDecoder {
         android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
 
         val options = android.graphics.BitmapFactory.Options().apply {
-            inSampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, MAX_DECODE_EDGE)
+            inSampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, maxEdge)
             inPreferredConfig = Bitmap.Config.ARGB_8888
         }
-        return android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+        val raw = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
             ?: throw IllegalStateException("cannot decode the captured JPEG")
+        val rot = runCatching { image.imageInfo.rotationDegrees }.getOrDefault(0)
+        if (rot % 360 == 0) return raw
+        val matrix = android.graphics.Matrix().apply { postRotate(rot.toFloat()) }
+        return runCatching {
+            Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
+        }.getOrDefault(raw)
     }
 
     /** Largest power-of-two subsample that keeps the long edge at or above `maxEdge`. */

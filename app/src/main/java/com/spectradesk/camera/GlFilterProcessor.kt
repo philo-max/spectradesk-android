@@ -113,6 +113,12 @@ class GlFilterProcessor : SurfaceProcessor {
     var grade: ColorGrade = ColorGrade.NONE
 
     /**
+     * 算法高清/超清画质增强强度（0 = 关闭，0.55 = 高清 CAS，1.0 = 超清多尺度重构）。
+     */
+    @Volatile
+    var clarity: Float = 0f
+
+    /**
      * 水平镜像。前置摄像头打开，后置关闭。
      *
      * 为什么在顶点着色器里翻而不是在 SurfaceView 上做 scaleX=-1：
@@ -180,6 +186,7 @@ class GlFilterProcessor : SurfaceProcessor {
     private var uGradeALoc = 0
     private var uGradeBLoc = 0
     private var uGradeCLoc = 0
+    private var uClarityLoc = 0
     private var uTexelLoc = 0
     /** 每帧自增，给颗粒噪声当种子。 */
     private var frameSeed = 0f
@@ -523,16 +530,28 @@ class GlFilterProcessor : SurfaceProcessor {
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
             GLES20.glUniformMatrix4fv(uMatrixLoc, 1, false, updatedTransform, 0)
             GLES20.glUniform2f(uViewSizeLoc, vw.toFloat(), vh.toFloat())
-            // 传**旋转之后**的帧尺寸：u_matrix 常含 90° 旋转（横拍的传感器帧
-            // 转成竖屏显示），旋转后纵横比会倒过来。用未旋转的尺寸算填充裁剪
-            // 会让画面被拉长 —— 这正是上一版变形的原因。
-            val rotated = isQuarterTurn(updatedTransform)
+            // 传**旋转之后**的帧尺寸：
+            // 1. 真机上 SurfaceTexture.getTransformMatrix(updatedTransform) 通常已经包含了
+            //    传感器的 90°/270° 旋转（此时 isQuarterTurn(updatedTransform) == true）。
+            //    如果这时再传 previewRotation (90°/270°)，就会把已经转正的画面再转躺倒一次，
+            //    并且宽高比颠倒导致画面被拉伸 3 倍！
+            // 2. 只有当 updatedTransform 完全没转（!matrixTurn）时，才用 previewRotation 补转。
+            val matrixTurn = isQuarterTurn(updatedTransform)
+            val rotDeg = if (isPreview && !matrixTurn) previewRotation else 0
+            val extraTurn = (rotDeg / 90) % 2 != 0
+            val rotated = matrixTurn != extraTurn
             val aw = if (rotated) frameH else frameW
             val ah = if (rotated) frameW else frameH
             GLES20.glUniform2f(uFrameSizeLoc, aw.toFloat(), ah.toFloat())
-            GLES20.glUniform1f(uMirrorLoc, if (mirror) 1f else 0f)
-            // 预览补旋转；录像的矩阵已含旋转，传 0。
-            val rotDeg = if (isPreview) previewRotation else 0
+            // 如果 SurfaceTexture 矩阵本身不含旋转（如部分模拟器），才需要手动补 mirror；
+            // 真机上 SurfaceTexture 对前置摄像头在 getTransformMatrix() 中已处理好镜像，
+            // 若在矩阵之外再翻一次或翻错轴就会颠倒。这里统一在屏幕空间判断：
+            val matrixDet = updatedTransform[0] * updatedTransform[5] -
+                updatedTransform[1] * updatedTransform[4]
+            // 正常 SurfaceTexture 含一次 Y 翻转（det < 0）；若前置已被 HAL 镜像过则 det > 0。
+            val alreadyMirrored = matrixDet > 0f
+            val needMirror = mirror && !alreadyMirrored
+            GLES20.glUniform1f(uMirrorLoc, if (needMirror) 1f else 0f)
             GLES20.glUniform1f(uRotateLoc, Math.toRadians(rotDeg.toDouble()).toFloat())
             GLES20.glUniform1i(uFilterLoc, filter.ordinal)
             GLES20.glUniform1f(uIntensityLoc, intensity)
@@ -557,7 +576,12 @@ class GlFilterProcessor : SurfaceProcessor {
                 // 固定种子会让颗粒在画面上"钉死"，看起来像脏点而不是胶片颗粒。
                 GLES20.glUniform4f(uGradeCLoc, g.vignette, g.grain, frameSeed, 0f)
             }
-            GLES20.glUniform2f(uTexelLoc, 1f / frameW, 1f / frameH)
+            GLES20.glUniform2f(
+                uTexelLoc,
+                1f / frameW.coerceAtLeast(1),
+                1f / frameH.coerceAtLeast(1),
+            )
+            GLES20.glUniform1f(uClarityLoc, clarity)
 
             positionBuffer.position(0)
             GLES20.glEnableVertexAttribArray(aPositionLoc)
@@ -671,6 +695,7 @@ class GlFilterProcessor : SurfaceProcessor {
         uGradeALoc = GLES20.glGetUniformLocation(program, "u_gradeA")
         uGradeBLoc = GLES20.glGetUniformLocation(program, "u_gradeB")
         uGradeCLoc = GLES20.glGetUniformLocation(program, "u_gradeC")
+        uClarityLoc = GLES20.glGetUniformLocation(program, "u_clarity")
         uTexelLoc = GLES20.glGetUniformLocation(program, "u_texel")
 
         initialized = true
@@ -851,22 +876,18 @@ class GlFilterProcessor : SurfaceProcessor {
         varying vec2 v_texCoord;
         void main() {
             gl_Position = a_position;
-            vec2 uv = (u_matrix * a_texCoord).xy;
+            // 水平镜像必须在乘 u_matrix 之前（屏幕空间 x 轴 = 左右方向）进行！
+            // 如果在乘完含 90° 旋转的 u_matrix 之后再翻 uv.x，翻的是屏幕的上下方向（变成上下颠倒）。
+            vec4 tc = a_texCoord;
+            if (u_mirror > 0.5) tc.x = 1.0 - tc.x;
+            vec2 uv = (u_matrix * tc).xy;
 
-            // 预览路径需要补旋转，录像路径不需要。
-            //
-            // 录像走 SurfaceOutput.updateTransformMatrix()，CameraX 已经把
-            // 旋转算进矩阵里了（所以 u_rotate = 0）。
-            // 预览只有 SurfaceTexture 自己的矩阵，它不含"传感器朝向 + 显示
-            // 旋转"，所以要在这里按 Camera2 的标准公式补上。
             if (u_rotate != 0.0) {
                 vec2 c = uv - 0.5;
                 float s = sin(u_rotate);
                 float co = cos(u_rotate);
                 uv = vec2(c.x * co - c.y * s, c.x * s + c.y * co) + 0.5;
             }
-
-            if (u_mirror > 0.5) uv.x = 1.0 - uv.x;
 
             // 中心裁剪填满取景框（等比，不拉伸）。
             //
@@ -908,6 +929,7 @@ class GlFilterProcessor : SurfaceProcessor {
         uniform vec4 u_gradeA;   // 亮度 对比度 饱和度 色温
         uniform vec4 u_gradeB;   // 色调 高光 阴影 锐化
         uniform vec4 u_gradeC;   // 暗角 颗粒 噪声种子 -
+        uniform float u_clarity; // 算法高清/超清强度（0=关, 0.55=高清, 1.0=超清）
         uniform vec2 u_texel;    // 1/帧宽, 1/帧高（锐化取邻居用）
 
         const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
@@ -1045,6 +1067,117 @@ class GlFilterProcessor : SurfaceProcessor {
                 }
 
                 rgb = clamp(rgb, 0.0, 1.0);
+            }
+
+            // ── 算法高清 / 超清 / 超清HDR（HydraSharp V2 + 3×3 双边降噪 + OneKeyHDR）────
+            //
+            // 对标抖音 BMF (libbmf_hydra_lite.so) 的四段式实时画质增强架构：
+            // 1. 统一在原始纹理的感知亮度域 Y = dot(c, LUMA) 上计算 3×3 九点邻域（十字 + 对角线），
+            //    避免滤镜/调色干扰空间梯度，且彻底解决 4 点十字采样在 45° 斜边上的阶梯锯齿。
+            // 2. Stage 1 - PackageDenoise 3×3 双边保边降噪：
+            //    利用亮度差高斯权重 w = exp(-dL^2 * 900) 平滑平坦区/暗部 CMOS 颗粒噪点，真边缘不模糊。
+            // 3. Stage 2 - HydraSharp 自适应锐化：
+            //    - threshold 死区噪声门限：微弱梯度 |hf| < 0.005 直接归零，绝不放大底噪；
+            //    - lc_weight_thr 局部反差自适应：中低反差纹理（毛发/织物/远景字迹）放大增益 g0，
+            //      高反差强边缘自动衰减；
+            //    - over_ratio 过冲抗光晕钳位：把亮度增量严格夹在 [minL - over*lc, maxL + over*lc] 内，
+            //      从数学上杜绝传统 USM 锐化的黑白光晕边。
+            // 4. Stage 3 - SuperRes 2.0× 多尺度微反差 + OneKeyHDR / AesBoost 局部色调与自然鲜艳度提振。
+            if (u_clarity > 0.01) {
+                float tx = u_texel.x;
+                float ty = u_texel.y;
+
+                // 3×3 九点原始亮度采样（十字 + 对角线，保证各向同性无锯齿）
+                float lC0 = dot(src.rgb, LUMA);
+                float lN  = dot(texture2D(u_texture, v_texCoord + vec2( 0.0, -ty)).rgb, LUMA);
+                float lS  = dot(texture2D(u_texture, v_texCoord + vec2( 0.0,  ty)).rgb, LUMA);
+                float lW  = dot(texture2D(u_texture, v_texCoord + vec2(-tx,  0.0)).rgb, LUMA);
+                float lE  = dot(texture2D(u_texture, v_texCoord + vec2( tx,  0.0)).rgb, LUMA);
+                float lNW = dot(texture2D(u_texture, v_texCoord + vec2(-tx, -ty)).rgb, LUMA);
+                float lNE = dot(texture2D(u_texture, v_texCoord + vec2( tx, -ty)).rgb, LUMA);
+                float lSW = dot(texture2D(u_texture, v_texCoord + vec2(-tx,  ty)).rgb, LUMA);
+                float lSE = dot(texture2D(u_texture, v_texCoord + vec2( tx,  ty)).rgb, LUMA);
+
+                // Stage 1: 3×3 双边保边降噪（Bilateral Luma Denoise）
+                float dN  = lN  - lC0; float wN  = exp(-dN  * dN  * 900.0);
+                float dS  = lS  - lC0; float wS  = exp(-dS  * dS  * 900.0);
+                float dW  = lW  - lC0; float wW  = exp(-dW  * dW  * 900.0);
+                float dE  = lE  - lC0; float wE  = exp(-dE  * dE  * 900.0);
+                float dNW = lNW - lC0; float wNW = exp(-dNW * dNW * 900.0) * 0.7;
+                float dNE = lNE - lC0; float wNE = exp(-dNE * dNE * 900.0) * 0.7;
+                float dSW = lSW - lC0; float wSW = exp(-dSW * dSW * 900.0) * 0.7;
+                float dSE = lSE - lC0; float wSE = exp(-dSE * dSE * 900.0) * 0.7;
+
+                float wSum = 1.8 + wN + wS + wW + wE + wNW + wNE + wSW + wSE;
+                float lDenoised = (
+                    1.8 * lC0 +
+                    wN * lN + wS * lS + wW * lW + wE * lE +
+                    wNW * lNW + wNE * lNE + wSW * lSW + wSE * lSE
+                ) / wSum;
+                float denoiseDelta = (lDenoised - lC0) * 0.75;
+
+                // Stage 2: HydraSharp 3×3 各向同性高斯差分 + 局部反差自适应 + 过冲钳位
+                float lGauss = (
+                    4.0 * lDenoised +
+                    2.0 * (lN + lS + lW + lE) +
+                    (lNW + lNE + lSW + lSE)
+                ) * 0.0625;
+                float hf = lDenoised - lGauss;
+
+                float minCross = min(min(lN, lS), min(lW, lE));
+                float maxCross = max(max(lN, lS), max(lW, lE));
+                float minDiag  = min(min(lNW, lNE), min(lSW, lSE));
+                float maxDiag  = max(max(lNW, lNE), max(lSW, lSE));
+                float minL = min(lC0, min(minCross, minDiag));
+                float maxL = max(lC0, max(maxCross, maxDiag));
+                float lc = maxL - minL;
+
+                // threshold 死区噪声门 + 暗部保护门（抑制 ISO 暗噪）
+                float thresholdGate = smoothstep(0.0045, 0.016, abs(hf));
+                float darkGate = smoothstep(0.025, 0.10, lC0);
+                // lc_weight_thr 局部反差自适应：中频细节 (lc ~ 0.02..0.22) 增益最高，强边缘自动收敛
+                float lcBoost = (1.0 + 0.65 * smoothstep(0.015, 0.20, lc))
+                              * (1.0 - 0.60 * smoothstep(0.24, 0.70, lc));
+                float sharpWeight = mix(0.85, 1.55, clamp(u_clarity, 0.0, 1.0))
+                                  * thresholdGate * darkGate * lcBoost;
+                float sharpDelta = hf * sharpWeight;
+
+                // Stage 3: 超清档 (u_clarity >= 0.9) 叠加 2.0× 多尺度中频微反差重构
+                float midL = lGauss;
+                if (u_clarity >= 0.9) {
+                    float fN = dot(texture2D(u_texture, v_texCoord + vec2(0.0, -ty * 2.0)).rgb, LUMA);
+                    float fS = dot(texture2D(u_texture, v_texCoord + vec2(0.0,  ty * 2.0)).rgb, LUMA);
+                    float fW = dot(texture2D(u_texture, v_texCoord + vec2(-tx * 2.0, 0.0)).rgb, LUMA);
+                    float fE = dot(texture2D(u_texture, v_texCoord + vec2( tx * 2.0, 0.0)).rgb, LUMA);
+                    midL = (fN + fS + fW + fE) * 0.25;
+                    float midHf = lDenoised - midL;
+                    sharpDelta += midHf * 0.42 * darkGate * smoothstep(0.006, 0.025, abs(midHf));
+                }
+
+                // over_ratio 过冲抗光晕钳位（防止白边/黑边振铃）
+                float overRatio = (u_clarity >= 0.9) ? 0.095 : 0.075;
+                float maxAllowedDelta = (maxL - lC0) + overRatio * lc;
+                float minAllowedDelta = (minL - lC0) - overRatio * lc;
+                sharpDelta = clamp(sharpDelta, minAllowedDelta, maxAllowedDelta);
+
+                rgb = clamp(rgb + vec3(denoiseDelta + sharpDelta), 0.0, 1.0);
+
+                // Stage 4: 超清HDR (u_clarity > 1.15) 叠加 OneKeyHDR 局部暗部提亮 + 高光保护 + AesBoost
+                if (u_clarity > 1.15) {
+                    float lumNow = dot(rgb, LUMA);
+                    // 基于 2.0× 邻域包络 midL 做局部阴影提亮与高光柔和滚降，保留局部反差不发灰
+                    float shadowLift = (1.0 - midL) * (1.0 - midL) * 0.13 * smoothstep(0.015, 0.08, lumNow);
+                    float highlightRoll = midL * midL * 0.07;
+                    rgb = clamp(rgb + vec3(shadowLift - highlightRoll), 0.0, 1.0);
+
+                    // AesBoost 自适应自然饱和度：优先提振低饱和色彩，保护高饱和与肤色不溢出
+                    float gNow = dot(rgb, LUMA);
+                    float maxCh = max(max(rgb.r, rgb.g), rgb.b);
+                    float minCh = min(min(rgb.r, rgb.g), rgb.b);
+                    float sat = maxCh - minCh;
+                    float vibrance = 1.0 + 0.16 * (1.0 - sat);
+                    rgb = clamp(mix(vec3(gNow), rgb, vibrance), 0.0, 1.0);
+                }
             }
 
             gl_FragColor = vec4(rgb, src.a);

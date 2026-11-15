@@ -40,8 +40,15 @@ data class UiState(
     /** 设备物理朝向，驱动横竖屏自适应。 */
     val orientation: OrientationTracker.DeviceOrientation =
         OrientationTracker.DeviceOrientation.PORTRAIT,
-    /** 最近一次点按对焦的位置（归一化），用于画对焦框。null = 不显示。 */
-    val focusPoint: Pair<Float, Float>? = null,
+    /** 实时重力传感器倾角与水平仪状态（对应 Moto Camera LevelerView）。 */
+    val gravity: OrientationTracker.GravityState =
+        OrientationTracker.GravityState(),
+    /** 取景器上的对焦框。null = 不显示。 */
+    val focusMark: FocusMark? = null,
+    /** 参数面板当前分类。 */
+    val paramsTab: ParamsTab = ParamsTab.LENS,
+    /** 前置屏幕补光快门瞬间强光脉冲（对应 FrontDisplayFlash.mFlashFired）。 */
+    val screenFlashPulse: Boolean = false,
 ) {
     val activeStandard: ColorStandard?
         get() = activeStandardName?.let { Standards.byName(it) }
@@ -326,13 +333,205 @@ class CameraViewModel : ViewModel() {
         _state.update { if (it.orientation == o) it else it.copy(orientation = o) }
     }
 
+    /** 实时重力感应状态更新（含横竖屏象限 + LevelerView 倾角 + 平放检测）。 */
+    fun updateGravity(g: OrientationTracker.GravityState) {
+        _state.update {
+            if (it.orientation == g.orientation && it.gravity == g) it
+            else it.copy(orientation = g.orientation, gravity = g)
+        }
+    }
+
+    /** 切换取景器重力电子水平仪开关。 */
+    fun setLevelerEnabled(on: Boolean) {
+        _state.update {
+            if (it.settings.levelerEnabled == on) it
+            else it.copy(
+                settings = it.settings.copy(levelerEnabled = on),
+                message = if (on) "重力电子水平仪已开启" else "重力电子水平仪已关闭",
+            )
+        }
+    }
+
     /** 点按对焦的结果提示。 */
     fun reportFocus(ok: Boolean, x: Float, y: Float) {
         _state.update {
             it.copy(
-                focusPoint = if (ok) x to y else null,
+                focusMark = FocusMark(x, y, locked = false, success = ok, id = ++focusSeq),
                 message = if (ok) null else "对焦未成功（可能太近或光线不足）",
             )
+        }
+    }
+
+    private var focusSeq = 0L
+
+    /**
+     * 开始一次点按对焦：立刻画框（白色 = 对焦中），返回这次的 id。
+     *
+     * 点按同时意味着"我要自动对焦"，所以顺手退出手动对焦 —— 否则
+     * AF_MODE_OFF 还盖着，点了也不会动。
+     */
+    fun beginFocus(x: Float, y: Float, lock: Boolean): Long {
+        val id = ++focusSeq
+        _state.update {
+            it.copy(
+                focusMark = FocusMark(x, y, locked = lock, success = null, id = id),
+                settings = it.settings.copy(manualFocus = null),
+                message = if (lock) "AE/AF 已锁定 · 点按任意处解锁" else null,
+            )
+        }
+        return id
+    }
+
+    /** 对焦结束。id 不匹配说明用户已经点了下一处，旧结果丢弃。 */
+    fun finishFocus(id: Long, ok: Boolean) {
+        _state.update {
+            val mark = it.focusMark
+            if (mark == null || mark.id != id) it
+            else it.copy(focusMark = mark.copy(success = ok))
+        }
+    }
+
+    /** 淡出对焦框（锁定的不淡出）。 */
+    fun clearFocusMark(id: Long) {
+        _state.update {
+            val mark = it.focusMark
+            if (mark == null || mark.id != id || mark.locked) it else it.copy(focusMark = null)
+        }
+    }
+
+    fun setParamsTab(tab: ParamsTab) {
+        _state.update { it.copy(paramsTab = tab) }
+    }
+
+    /**
+     * 录像分辨率。录像中不允许改 —— 改它要重建相机会话，正在写的文件会被截断。
+     * 滑到 4K / 8K 时自动开启「超清」CAS 多尺度细节重构算法。
+     */
+    fun setVideoResolution(res: VideoResolution) {
+        _state.update {
+            when {
+                it.settings.videoResolution == res -> it
+                it.recording -> it.copy(message = "录像中不能切换分辨率")
+                else -> {
+                    val autoClarity = if (res == VideoResolution.UHD_8K || res == VideoResolution.UHD) {
+                        ClarityMode.ULTRA
+                    } else {
+                        it.settings.clarityMode
+                    }
+                    it.copy(
+                        settings = it.settings.copy(
+                            videoResolution = res,
+                            clarityMode = autoClarity,
+                        ),
+                        message = if (res == VideoResolution.UHD_8K) {
+                            "分辨率 → 8K · 已联动开启「超清」细节重构算法"
+                        } else {
+                            "录像分辨率 → ${res.label}"
+                        },
+                    )
+                }
+            }
+        }
+    }
+
+    fun setVideoFps(fps: Int) {
+        _state.update {
+            when {
+                it.settings.videoFps == fps -> it
+                it.recording -> it.copy(message = "录像中不能切换帧率")
+                else -> it.copy(
+                    settings = it.settings.copy(videoFps = fps),
+                    message = "录像帧率 → ${fps}fps",
+                )
+            }
+        }
+    }
+
+    /** 算法画质增强档位（标准 / 高清 HydraSharp / 超清多尺度重构 / 超清HDR）。 */
+    fun setClarityMode(mode: ClarityMode) {
+        _state.update {
+            if (it.settings.clarityMode == mode) it
+            else it.copy(
+                settings = it.settings.copy(clarityMode = mode),
+                message = "画质算法 → ${mode.label}（${mode.desc}）",
+            )
+        }
+    }
+
+    /** 硬件防抖（EIS/OIS）+ 3DNR 降噪协同开关。 */
+    fun setVideoStabilization(on: Boolean) {
+        _state.update {
+            if (it.settings.videoStabilization == on) it
+            else it.copy(
+                settings = it.settings.copy(videoStabilization = on),
+                message = if (on) "已开启 EIS/OIS 硬件防抖 + 3DNR 协同" else "已关闭视频防抖",
+            )
+        }
+    }
+
+    /** 设置闪光灯 / 屏幕柔光环补光档位。 */
+    fun setFlashMode(mode: FlashMode) {
+        _state.update {
+            if (it.settings.flashMode == mode) it
+            else {
+                val isFront = it.settings.lensFacing ==
+                    androidx.camera.core.CameraSelector.LENS_FACING_FRONT
+                val desc = if (isFront) {
+                    when (mode) {
+                        FlashMode.OFF -> "前置屏幕补光 → 关闭"
+                        FlashMode.AUTO -> "前置屏幕补光 → 自动柔光闪"
+                        FlashMode.ON -> "前置屏幕补光 → 快门屏幕柔光闪"
+                        FlashMode.TORCH -> "前置屏幕补光 → 柔光环常亮（屏幕峰值亮度）"
+                    }
+                } else {
+                    when (mode) {
+                        FlashMode.OFF -> "后置闪光灯 → 关闭"
+                        FlashMode.AUTO -> "后置闪光灯 → 自动"
+                        FlashMode.ON -> "后置闪光灯 → 开启（录像时自动转常亮）"
+                        FlashMode.TORCH -> "后置闪光灯 → LED 常亮补光灯"
+                    }
+                }
+                it.copy(
+                    settings = it.settings.copy(flashMode = mode),
+                    message = desc,
+                )
+            }
+        }
+    }
+
+    /** 取景器左上角快捷循环切换闪光灯档位：关 → 自动 → 开启 → 常亮补光。 */
+    fun cycleFlashMode() {
+        val current = _state.value.settings.flashMode
+        val next = when (current) {
+            FlashMode.OFF -> FlashMode.AUTO
+            FlashMode.AUTO -> FlashMode.ON
+            FlashMode.ON -> FlashMode.TORCH
+            FlashMode.TORCH -> FlashMode.OFF
+        }
+        setFlashMode(next)
+    }
+
+    /** 设置前置屏幕柔光环色温（暖阳柔光 / 自然冷白 / 蜜桃粉光）。 */
+    fun setScreenFlashTone(tone: ScreenFlashTone) {
+        _state.update {
+            it.copy(
+                settings = it.settings.copy(screenFlashTone = tone),
+                message = "前置柔光色温 → ${tone.label}",
+            )
+        }
+    }
+
+    /** 快门触发前置屏幕强光脉冲。 */
+    fun setScreenFlashPulse(active: Boolean) {
+        _state.update { it.copy(screenFlashPulse = active) }
+    }
+
+    /** 重绑后变焦范围可能变了（切镜头 / 物理超广角），把当前值夹进去。 */
+    fun clampZoom(range: ClosedFloatingPointRange<Float>) {
+        _state.update {
+            val z = it.settings.zoomRatio
+            val c = z.coerceIn(range)
+            if (c == z) it else it.copy(settings = it.settings.copy(zoomRatio = c))
         }
     }
 
@@ -370,15 +569,14 @@ class CameraViewModel : ViewModel() {
      * 这是唯一一个既改观感又改测量读数的参数 —— 换曝光等于换了物理条件，
      * 旧的白参考不再成立。所以改它要清标定，和切 GC 同理。
      */
-    fun setExposureIndex(index: Int) {
+    fun setExposureIndex(index: Int, stepEv: Double = 1.0 / 3.0) {
         _state.update { current ->
             if (current.settings.exposureIndex == index) return@update current
             current.copy(
                 settings = current.settings.copy(exposureIndex = index),
                 calibration = CalibrationState(),
                 exposureLocked = false,
-                message = "曝光补偿已改（%+.1f EV）：标定已清除，请重做白参考"
-                    .format(index / 3.0),
+                message = "曝光补偿 %+.1f EV · 标定已清除".format(index * stepEv),
             )
         }
     }
